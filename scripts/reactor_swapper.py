@@ -6,12 +6,10 @@ import cv2
 import numpy as np
 from PIL import Image
 
+import onnxruntime as ort
+
 import insightface
 from insightface.app.common import Face
-# try:
-#     import torch.cuda as cuda
-# except:
-#     cuda = None
 import torch
 
 import folder_paths
@@ -45,13 +43,6 @@ try:
 except Exception as e:
     logger.debug(f"ExecutionProviderError: {e}.\nEP is set to CPU.")
     providers = ["CPUExecutionProvider"]
-# if cuda is not None:
-#     if cuda.is_available():
-#         providers = ["CUDAExecutionProvider"]
-#     else:
-#         providers = ["CPUExecutionProvider"]
-# else:
-#     providers = ["CPUExecutionProvider"]
 
 models_path_old = os.path.join(os.path.dirname(os.path.dirname(__file__)), "models")
 insightface_path_old = os.path.join(models_path_old, "insightface")
@@ -61,6 +52,7 @@ models_path = folder_paths.models_dir
 insightface_path = os.path.join(models_path, "insightface")
 insightface_models_path = os.path.join(insightface_path, "models")
 reswapper_path = os.path.join(models_path, "reswapper")
+hyperswap_path = os.path.join(models_path, "hyperswap")
 
 if os.path.exists(models_path_old):
     move_path(insightface_models_path_old, insightface_models_path)
@@ -122,9 +114,163 @@ def getFaceSwapModel(model_path: str):
     if FS_MODEL is None or CURRENT_FS_MODEL_PATH is None or CURRENT_FS_MODEL_PATH != model_path:
         CURRENT_FS_MODEL_PATH = model_path
         FS_MODEL = unload_model(FS_MODEL)
-        FS_MODEL = insightface.model_zoo.get_model(model_path, providers=providers)
+
+        model_filename = os.path.basename(model_path)
+        if "hyperswap" in model_filename.lower():
+            model_path = os.path.join(folder_paths.models_dir, "hyperswap", model_filename)
+            FS_MODEL = ort.InferenceSession(model_path, providers=providers)
+        elif "reswapper" in model_filename.lower():
+            model_path = os.path.join(folder_paths.models_dir, "reswapper", model_filename)
+            FS_MODEL = insightface.model_zoo.get_model(model_path, providers=providers)
+        else:
+            FS_MODEL = insightface.model_zoo.get_model(model_path, providers=providers)
 
     return FS_MODEL
+
+
+# Функция для получения 5 ключевых точек из объекта Face
+def get_landmarks_5(face):
+    if hasattr(face, 'landmark_5') and face.landmark_5 is not None:
+        return face.landmark_5
+    elif hasattr(face, 'kps') and face.kps is not None:
+        return face.kps
+    elif hasattr(face, 'landmark') and face.landmark is not None:
+        if face.landmark.shape[0] >= 68:
+            idxs = [36, 45, 30, 48, 54]
+            return face.landmark[idxs]
+    return None
+
+# Функция для вычисления аффинного преобразования
+def get_affine_transform(src_pts, dst_pts):
+    M, _ = cv2.estimateAffinePartial2D(src_pts, dst_pts)
+    return M
+
+# Создаём градиентную маску овальной формы без обрезки 
+def create_gradient_mask(crop_size=256):
+    # 1. Создаём пустую маску (все пиксели = 0)
+    mask = np.zeros((crop_size, crop_size), dtype=np.float32)
+    
+    # 2. Определяем центр и размеры эллипса
+    center = (crop_size // 2, crop_size // 2)
+    axes = (int(crop_size * 0.35), int(crop_size * 0.4))
+    
+    # 3. Рисуем эллипс (заполняем белым цветом, значение=1.0)
+    cv2.ellipse(
+        mask,          # Массив для рисования
+        center,        # Центр эллипса
+        axes,          # Полуоси (ширина, высота)
+        angle=0,       # Угол поворота
+        startAngle=0,  # Начальный угол дуги
+        endAngle=360,  # Конечный угол дуги (360 = полный эллипс)
+        color=1.0,     # Значение для заполнения (белый = 1.0)
+        thickness=-1   # -1 = заполнить всю область эллипса   
+    )
+    
+    # 4. Применяем размытие для плавных краёв
+    blur_ksize = 15  # Нечётное число, чтобы ядро было симметричным
+    mask = cv2.GaussianBlur(mask, (blur_ksize, blur_ksize), 0)
+    
+    # 5. Ограничим значения в диапазоне [0, 1]
+    mask = np.clip(mask, 0, 1)
+    
+    return mask
+
+def paste_back(target_img, swapped_face, M, crop_size=256):
+    
+    # 1. Создание мягкой маски (Эрозия + Размытие)
+    mask = create_gradient_mask(crop_size)
+
+    # Преобразуем в трехканальную маску
+    mask_3c = np.stack([mask] * 3, axis=2)
+
+    # 2. Получаем размеры целевого изображения
+    h, w = target_img.shape[:2]
+
+    # 3. Обратное преобразование (WARP_INVERSE_MAP) для лица И маски
+    # Для лица (INTER_LANCZOS4 — высококачественная интерполяция)
+    inv_face = cv2.warpAffine(
+        swapped_face.astype(np.float32),
+        M,
+        (w, h),
+        flags=cv2.INTER_LANCZOS4 | cv2.WARP_INVERSE_MAP,
+        borderMode=cv2.BORDER_TRANSPARENT
+    )
+
+    # Для маски (INTER_CUBIC — плавные границы)
+    inv_mask = cv2.warpAffine(
+        mask_3c,
+        M,
+        (w, h),
+        flags=cv2.INTER_CUBIC | cv2.WARP_INVERSE_MAP,
+        borderMode=cv2.BORDER_TRANSPARENT
+    )
+
+    # 4. Ограничение значений маски [0, 1]
+    inv_mask = np.clip(inv_mask, 0, 1)
+
+    # 5. Дополнительное размытие для устранения артефактов
+    inv_mask = cv2.GaussianBlur(inv_mask, (3, 3), 0)
+
+    # 6. Плавное наложение
+    target_img_float = target_img.astype(np.float32)
+    inv_face_float = inv_face.astype(np.float32)
+    result = target_img_float * (1.0 - inv_mask) + inv_face_float * inv_mask
+
+    # 7. Ограничение результата [0, 255]
+    result = np.clip(result, 0, 255).astype(np.uint8)
+
+    return result
+
+def visualize_points(img, points, color=(0, 255, 0)):
+    img = img.copy()
+    for p in points:
+        cv2.circle(img, tuple(p.astype(int)), 3, color, -1)
+
+# Итоговая функция run_hyperswap с аффинным преобразованием
+def run_hyperswap(session, source_face, target_face, target_img):
+    # 1. Подготовка эмбеддинга
+    source_embedding = source_face.normed_embedding.reshape(1, -1).astype(np.float32)
+
+    # 2. Получаем 5 точек target
+    target_landmarks_5 = get_landmarks_5(target_face)
+    visualize_points(target_img, target_landmarks_5, (0, 255, 0))  # Зеленые точки
+    
+    if target_landmarks_5 is None:
+        return None, None
+
+    # 3. Определение эталонных точек для выравнивания 256x256 (FFHQ Alignment)
+    std_landmarks_256 = np.array([
+        [ 84.87, 105.94],  # Левый глаз
+        [171.13, 105.94],  # Правый глаз
+        [128.00, 146.66],  # Кончик носа
+        [ 96.95, 188.64],  # Левый уголок рта
+        [159.05, 188.64]   # Правый уголок рта
+    ], dtype=np.float32)
+
+    # Вычисляем аффинную матрицу
+    M = get_affine_transform(target_landmarks_5.astype(np.float32), std_landmarks_256)
+    
+    # Применяем аффинное преобразование с новой матрицей M
+    crop = cv2.warpAffine(target_img, M, (256, 256), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REFLECT)
+
+    # 4. Преобразуем crop для модели
+    crop_input = crop[:, :, ::-1].astype(np.float32) / 255.0  # RGB -> [0,1]
+    crop_input = (crop_input - 0.5) / 0.5  # Нормализация
+    crop_input = crop_input.transpose(2, 0, 1)[np.newaxis, ...].astype(np.float32)
+
+    # 5. Инференс
+    try:
+        output = session.run(None, {'source': source_embedding, 'target': crop_input})[0][0]
+    except:
+        return target_img
+
+    # 6. Обратная нормализация
+    output = (output * 0.5 + 0.5) * 255.0  # [-1..1] -> [0..255]
+    output = np.clip(output, 0, 255).astype(np.uint8)
+    output = output.transpose(1, 2, 0)  # CHW -> HWC
+    output = output[:, :, ::-1]  # BGR -> RGB
+    
+    return output, M # Возвращаем лицо (256x256) и матрицу M
 
 
 def sort_by_order(face, order: str):
@@ -160,13 +306,13 @@ def get_face_gender(
     if len(filtered_faces) == 0:
         if gender_condition != 0:
             logger.status(f"No faces found for -{gender}-")
-        return None, 0  # treat as "wrong gender" to skip
+        return None, 0, None  # treat as "wrong gender" to skip
 
     faces_sorted = sort_by_order(filtered_faces, order)
 
     if face_index >= len(faces_sorted):
         logger.info("Requested face index (%s) is out of bounds (max available index is %s)", face_index, len(faces_sorted))
-        return None, 0
+        return None, 0, None
 
     face_selected = faces_sorted[face_index]
 
@@ -175,9 +321,9 @@ def get_face_gender(
     expected_gender = "F" if gender_condition == 1 else "M"
     if gender_condition != 0 and face_selected.sex != expected_gender:
         logger.info(f"{operated} Face {face_index}: WRONG gender ({face_selected.sex})")
-        return face_selected, 1  # <-- есть, но не тот пол
+        return face_selected, 1, face_index  # <-- есть, но не тот пол
 
-    return face_selected, 0
+    return face_selected, 0, face_index
 
 def half_det_size(det_size):
     logger.status("Trying to halve 'det_size' parameter")
@@ -223,10 +369,10 @@ def get_face_single(img_data: np.ndarray, face, face_index=0, det_size=(640, 640
 
     try:
         faces_sorted = sort_by_order(face, order)
-        return faces_sorted[face_index], 0
+        return faces_sorted[face_index], 0, face_index
         # return sorted(face, key=lambda x: x.bbox[0])[face_index], 0
     except IndexError:
-        return None, 0
+        return None, 0, None
 
 
 def swap_face(
@@ -247,6 +393,8 @@ def swap_face(
 ):
     global SOURCE_FACES, SOURCE_IMAGE_HASH, TARGET_FACES, TARGET_IMAGE_HASH
     result_image = target_img
+    bbox = []
+    swapped_indexes = []
 
     if model is not None:
 
@@ -326,11 +474,11 @@ def swap_face(
             # No use in trying to swap faces if no faces are found, enhancement
             if len(target_faces) == 0:
                 logger.status("Cannot detect any Target, skipping swapping...")
-                return result_image
+                return result_image, bbox, swapped_indexes
 
             if source_img is not None:
                 # separated management of wrong_gender between source and target, enhancement
-                source_face, src_wrong_gender = get_face_single(source_img, source_faces, face_index=source_faces_index[0], gender_source=gender_source, order=faces_order[1])
+                source_face, src_wrong_gender, source_face_index = get_face_single(source_img, source_faces, face_index=source_faces_index[0], gender_source=gender_source, order=faces_order[1])
             else:
                 # source_face = sorted(source_faces, key=lambda x: x.bbox[0])[source_faces_index[0]]
                 source_face = sorted(source_faces, key=lambda x: (x.bbox[2] - x.bbox[0]) * (x.bbox[3] - x.bbox[1]), reverse = True)[source_faces_index[0]]
@@ -344,6 +492,9 @@ def swap_face(
                     model_path = os.path.join(insightface_path, model)
                 elif "reswapper" in model:
                     model_path = os.path.join(reswapper_path, model)
+                elif "hyperswap" in model:
+                    model_path = os.path.join(hyperswap_path, model)
+                
                 face_swapper = getFaceSwapModel(model_path)
 
                 source_face_idx = 0
@@ -355,38 +506,35 @@ def swap_face(
                         break
 
                     if len(source_faces_index) > 1 and source_face_idx > 0:
-                        source_face, src_wrong_gender = get_face_single(source_img, source_faces, face_index=source_faces_index[source_face_idx], gender_source=gender_source, order=faces_order[1])
+                        source_face, src_wrong_gender, source_face_index = get_face_single(source_img, source_faces, face_index=source_faces_index[source_face_idx], gender_source=gender_source, order=faces_order[1])
                     source_face_idx += 1
 
                     if source_face is not None and src_wrong_gender == 0:
-                        target_face, wrong_gender = get_face_single(target_img, target_faces, face_index=face_num, gender_target=gender_target, order=faces_order[0])
+                        target_face, wrong_gender, target_face_index = get_face_single(target_img, target_faces, face_index=face_num, gender_target=gender_target, order=faces_order[0])
                         if target_face is not None and wrong_gender == 0:
                             logger.status(f"Swapping...")
-                            if face_boost_enabled:
-                                logger.status(f"Face Boost is enabled")
+                            if "hyperswap" in model:
+                                swapped_face_256, M = run_hyperswap(face_swapper, source_face, target_face, result)
+                                if swapped_face_256 is not None:
+                                    result = paste_back(result, swapped_face_256, M, crop_size=256)
+                            elif face_boost_enabled:
+                                logger.status(f"Face Boost is enabled (inswapper/reswapper only)")
                                 bgr_fake, M = face_swapper.get(result, target_face, source_face, paste_back=False)
                                 bgr_fake, scale = restorer.get_restored_face(bgr_fake, face_restore_model, face_restore_visibility, codeformer_weight, interpolation)
                                 M *= scale
-                                result = swapper.in_swap(target_img, bgr_fake, M)
+                                result = swapper.in_swap(result, bgr_fake, M)
                             else:
-                                # logger.status(f"Swapping as-is")
                                 result = face_swapper.get(result, target_face, source_face)
+                            bbox = [tuple(map(float, target_face.bbox))]
+                            swapped_indexes = [target_face_index]
                         elif wrong_gender == 1:
                             wrong_gender = 0
-                            # Keep searching for other faces if wrong gender is detected, enhancement
-                            #if source_face_idx == len(source_faces_index):
-                            #    result_image = Image.fromarray(cv2.cvtColor(result, cv2.COLOR_BGR2RGB))
-                            #    return result_image
                             logger.status("Wrong target gender detected")
                             continue
                         else:
                             logger.info(f"No target face found for {face_num}")
                     elif src_wrong_gender == 1:
                         src_wrong_gender = 0
-                        # Keep searching for other faces if wrong gender is detected, enhancement
-                        #if source_face_idx == len(source_faces_index):
-                        #    result_image = Image.fromarray(cv2.cvtColor(result, cv2.COLOR_BGR2RGB))
-                        #    return result_image
                         logger.status("Wrong source gender detected")
                         continue
                     else:
@@ -398,7 +546,7 @@ def swap_face(
                 logger.status("No source face(s) in the provided Index")
         else:
             logger.status("No source face(s) found")
-    return result_image
+    return result_image, bbox, swapped_indexes
 
 def swap_face_many(
     source_img: Union[Image.Image, None],
@@ -418,6 +566,8 @@ def swap_face_many(
 ):
     global SOURCE_FACES, SOURCE_IMAGE_HASH, TARGET_FACES, TARGET_IMAGE_HASH, TARGET_FACES_LIST, TARGET_IMAGE_LIST_HASH
     result_images = target_imgs
+    bbox = []
+    swapped_indexes = []
 
     if model is not None:
 
@@ -530,11 +680,11 @@ def swap_face_many(
             # No use in trying to swap faces if no faces are found, enhancement
             if len(target_faces) == 0:
                 logger.status("Cannot detect any Target, skipping swapping...")
-                return result_images
+                return result_images, bbox, swapped_indexes
 
             if source_img is not None:
                 # separated management of wrong_gender between source and target, enhancement
-                source_face, src_wrong_gender = get_face_single(source_img, source_faces, face_index=source_faces_index[0], gender_source=gender_source, order=faces_order[1])
+                source_face, src_wrong_gender, source_face_index = get_face_single(source_img, source_faces, face_index=source_faces_index[0], gender_source=gender_source, order=faces_order[1])
             else:
                 # source_face = sorted(source_faces, key=lambda x: x.bbox[0])[source_faces_index[0]]
                 source_face = sorted(source_faces, key=lambda x: (x.bbox[2] - x.bbox[0]) * (x.bbox[3] - x.bbox[1]), reverse = True)[source_faces_index[0]]
@@ -544,7 +694,13 @@ def swap_face_many(
                 logger.status(f'Source Faces must have no entries (default=0), one entry, or same number of entries as target faces.')
             elif source_face is not None:
                 results = target_imgs
-                model_path = model_path = os.path.join(insightface_path, model)
+                if "inswapper" in model:
+                    model_path = os.path.join(insightface_path, model)
+                elif "reswapper" in model:
+                    model_path = os.path.join(reswapper_path, model)
+                elif "hyperswap" in model:
+                    model_path = os.path.join(hyperswap_path, model)
+
                 face_swapper = getFaceSwapModel(model_path)
 
                 source_face_idx = 0
@@ -559,26 +715,31 @@ def swap_face_many(
                         break
 
                     if len(source_faces_index) > 1 and source_face_idx > 0:
-                        source_face, src_wrong_gender = get_face_single(source_img, source_faces, face_index=source_faces_index[source_face_idx], gender_source=gender_source, order=faces_order[1])
+                        source_face, src_wrong_gender, source_face_index = get_face_single(source_img, source_faces, face_index=source_faces_index[source_face_idx], gender_source=gender_source, order=faces_order[1])
                     source_face_idx += 1
 
                     if source_face is not None and src_wrong_gender == 0:
                         # Reading results to make current face swap on a previous face result
                         # logger.status(f"Swapping...")
                         for i, (target_img, target_face) in enumerate(zip(results, target_faces)):
-                            target_face_single, wrong_gender = get_face_single(target_img, target_face, face_index=face_num, gender_target=gender_target, order=faces_order[0])
+                            target_face_single, wrong_gender, target_face_index = get_face_single(target_img, target_face, face_index=face_num, gender_target=gender_target, order=faces_order[0])
                             if target_face_single is not None and wrong_gender == 0:
                                 result = target_img
-                                if face_boost_enabled:
-                                    logger.status(f"Face Boost is enabled")
+                                if "hyperswap" in model:
+                                    swapped_face_256, M = run_hyperswap(face_swapper, source_face, target_face_single, result)
+                                    if swapped_face_256 is not None:
+                                        result = paste_back(result, swapped_face_256, M, crop_size=256)
+                                elif face_boost_enabled:
+                                    logger.status(f"Face Boost is enabled (inswapper/reswapper only)")
                                     bgr_fake, M = face_swapper.get(target_img, target_face_single, source_face, paste_back=False)
                                     bgr_fake, scale = restorer.get_restored_face(bgr_fake, face_restore_model, face_restore_visibility, codeformer_weight, interpolation)
                                     M *= scale
                                     result = swapper.in_swap(target_img, bgr_fake, M)
                                 else:
-                                    # logger.status(f"Swapping as-is")
                                     result = face_swapper.get(target_img, target_face_single, source_face)
                                 results[i] = result
+                                bbox.append(tuple(map(float, target_face_single.bbox)))
+                                swapped_indexes.append(target_face_index)
                                 pbar.update(1)
                             elif wrong_gender == 1:
                                 wrong_gender = 0
@@ -603,4 +764,4 @@ def swap_face_many(
                 logger.status("No source face(s) in the provided Index")
         else:
             logger.status("No source face(s) found")
-    return result_images
+    return result_images, bbox, swapped_indexes

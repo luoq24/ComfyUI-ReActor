@@ -6,8 +6,8 @@ import modules.scripts as scripts
 # from modules.upscaler import Upscaler, UpscalerData
 from modules import scripts, scripts_postprocessing
 from modules.processing import (
-    StableDiffusionProcessing,
-    StableDiffusionProcessingImg2Img,
+    Processing,
+    ProcessingImg2Img,
 )
 from modules.shared import state
 from scripts.reactor_logger import logger
@@ -26,7 +26,8 @@ import comfy.model_management as model_management
 def get_models():
     swappers = [
         "insightface",
-        "reswapper"
+        "reswapper",
+        "hyperswap"
     ]
     models_list = []
     for folder in swappers:
@@ -42,7 +43,7 @@ class FaceSwapScript(scripts.Script):
 
     def process(
         self,
-        p: StableDiffusionProcessing,
+        p: Processing,
         img,
         enable,
         source_faces_index,
@@ -101,12 +102,12 @@ class FaceSwapScript(scripts.Script):
                 self.gender_target = 2
 
             # if self.source is not None:
-            if isinstance(p, StableDiffusionProcessingImg2Img) and swap_in_source:
+            if isinstance(p, ProcessingImg2Img) and swap_in_source:
                 logger.status(f"Working: source face index %s, target face index %s", self.source_faces_index, self.faces_index)
 
                 if len(p.init_images) == 1:
 
-                    result = swap_face(
+                    result, bbox, swapped_indexes = swap_face(
                         self.source,
                         p.init_images[0],
                         source_faces_index=self.source_faces_index,
@@ -123,27 +124,11 @@ class FaceSwapScript(scripts.Script):
                         interpolation=self.interpolation,
                     )
                     p.init_images[0] = result
-
-                    # for i in range(len(p.init_images)):
-                    #     if state.interrupted or model_management.processing_interrupted():
-                    #         logger.status("Interrupted by User")
-                    #         break
-                    #     if len(p.init_images) > 1:
-                    #         logger.status(f"Swap in %s", i)
-                    #     result = swap_face(
-                    #         self.source,
-                    #         p.init_images[i],
-                    #         source_faces_index=self.source_faces_index,
-                    #         faces_index=self.faces_index,
-                    #         model=self.model,
-                    #         gender_source=self.gender_source,
-                    #         gender_target=self.gender_target,
-                    #         face_model=self.face_model,
-                    #     )
-                    #     p.init_images[i] = result
+                    p.bbox = bbox
+                    p.swapped_indexes = swapped_indexes
 
                 elif len(p.init_images) > 1:
-                    result = swap_face_many(
+                    result, bbox, swapped_indexes = swap_face_many(
                         self.source,
                         p.init_images,
                         source_faces_index=self.source_faces_index,
@@ -160,34 +145,7 @@ class FaceSwapScript(scripts.Script):
                         interpolation=self.interpolation,
                     )
                     p.init_images = result
+                    p.bbox = bbox
+                    p.swapped_indexes = swapped_indexes
 
                 logger.status("--Done!--")
-            # else:
-            #     logger.error(f"Please provide a source face")
-
-    def postprocess_batch(self, p, *args, **kwargs):
-        if self.enable:
-            images = kwargs["images"]
-
-    def postprocess_image(self, p, script_pp: scripts.PostprocessImageArgs, *args):
-        if self.enable and self.swap_in_generated:
-            if self.source is not None:
-                logger.status(f"Working: source face index %s, target face index %s", self.source_faces_index, self.faces_index)
-                image: Image.Image = script_pp.image
-                result = swap_face(
-                    self.source,
-                    image,
-                    source_faces_index=self.source_faces_index,
-                    faces_index=self.faces_index,
-                    model=self.model,
-                    upscale_options=self.upscale_options,
-                    gender_source=self.gender_source,
-                    gender_target=self.gender_target,
-                )
-                try:
-                    pp = scripts_postprocessing.PostprocessedImage(result)
-                    pp.info = {}
-                    p.extra_generation_params.update(pp.info)
-                    script_pp.image = pp.image
-                except:
-                    logger.error(f"Cannot create a result image")

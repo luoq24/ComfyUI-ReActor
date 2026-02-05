@@ -2,7 +2,7 @@
 
   <img src="https://github.com/Gourieff/Assets/raw/main/sd-webui-reactor/ReActor_logo_NEW_EN.png?raw=true" alt="logo" width="180px"/>
 
-  ![Version](https://img.shields.io/badge/node_version-0.6.1_beta3-green?style=for-the-badge&labelColor=darkgreen)
+  ![Version](https://img.shields.io/badge/node_version-0.6.2_beta1-green?style=for-the-badge&labelColor=darkgreen)
 
   <!--<sup>
   <font color=brightred>
@@ -20,6 +20,9 @@
     </sup>
   </a>
 
+  <a href="https://t.me/reactor_faceswap" target="_blank"><img src="https://img.shields.io/badge/ReActor-2CA5E0?style=for-the-badge&logo=Telegram&logoColor=white&labelColor=blue"></img></a>
+  <a href="https://t.me/artgourieff" target="_blank"><img src="https://img.shields.io/badge/ArtGourieff-2CA5E0?style=for-the-badge&logo=Telegram&logoColor=white&labelColor=blue"></img></a>
+
   <hr>
   
   [![Commit activity](https://img.shields.io/github/commit-activity/t/Gourieff/ComfyUI-ReActor/main?cacheSeconds=0)](https://github.com/Gourieff/ComfyUI-ReActor/commits/main)
@@ -34,7 +37,7 @@
 
 </div>
 
-### The Fast and Simple Face Swap Extension Nodes for ComfyUI, based on [blocked ReActor](https://github.com/Gourieff/comfyui-reactor-node) - now it has a nudity detector to avoid using this software with 18+ content
+### The Fast and Simple Face Swap Extension Nodes for ComfyUI, based on [blocked ReActor](https://web.archive.org/web/20241230084620/https://github.com/Gourieff/comfyui-reactor-node) - now it has a nudity detector to avoid using this software with 18+ content
 
 > By using this Node you accept and assume [responsibility](#disclaimer)
 
@@ -51,12 +54,45 @@
 
 ## What's new in the latest update
 
-### 0.6.1 <sub><sup>BETA3</sup></sub>
+### 0.6.2 <sub><sup>BETA1</sup></sub>
+
+- Added support of HyperSwap models by FaceFusion Labs (thanks [@Buumcode](https://github.com/Buumcode) for contribution)<br>You can download them [here](https://huggingface.co/facefusion/models-3.3.0/tree/main)<br>(hyperswap_1a_256.onnx, hyperswap_1b_256.onnx, hyperswap_1c_256.onnx)<br>and put them into the `ComfyUI\models\hyperswap` directory
+
+<center>
+<img src="https://github.com/Gourieff/Assets/blob/main/comfyui-reactor-node/0.6.2-whatsnew-04-3.jpg?raw=true" alt="0.6.2-whatsnew-04-3" width="100%"/>
+</center>
+
+[Comparison grid](https://github.com/Gourieff/Assets/blob/main/comfyui-reactor-node/0.6.2_swapmodels_compare.png) of Inswapper vs Reswapper vs HyperSwap
+
+- Fixes and improvements
+
+### 0.6.2 <sub><sup>ALPHA2, ALPHA3, ALPHA4</sup></sub>
+
+- Small but important fixes
+
+### 0.6.2 <sub><sup>ALPHA1</sup></sub>
+
+- [Experimental] At last! Face restoration process affects only swapped faces
+
+<center>
+<img src="https://github.com/Gourieff/Assets/blob/main/comfyui-reactor-node/0.6.2-whatsnew-01.jpg?raw=true" alt="0.6.2-whatsnew-01" width="100%"/>
+</center>
+
+- [Experimental] New Node "Restore Face Advanced" with Face Restore Filter, thanks https://github.com/Buumcode for implementation of "Restore Face Filter"<br>This node helps you apply the restoration process to the face(s) you need
+
+<center>
+<img src="https://github.com/Gourieff/Assets/blob/main/comfyui-reactor-node/0.6.2-whatsnew-02.jpg?raw=true" alt="0.6.2-whatsnew-02" width="100%"/>
+</center>
+
+- Added FACE_MODEL_NAME output for "Load Face Model" node
+
+<center>
+<img src="https://github.com/Gourieff/Assets/blob/main/comfyui-reactor-node/0.6.2-whatsnew-03.jpg?raw=true" alt="0.6.2-whatsnew-03" width="50%"/>
+</center>
+
+### 0.6.1
 
 - Gender detection better logic for many faces and many indexes
-
-### 0.6.1 <sub><sup>BETA1, BETA2</sup></sub>
-
 - MaskHelper node 2x speed up - not perfect yet but 1.5x-2x faster then before
 - ComfyUI native ProgressBar for different steps
 - ORIGINAL_IMAGE output for main nodes
@@ -115,7 +151,7 @@ Just put them into the "models/reswapper" directory.
 - Sorting facemodels alphabetically
 - A lot of fixes and improvements
 
-### [0.5.0 <sub><sup>BETA4</sup></sub>](https://github.com/Gourieff/comfyui-reactor-node/releases/tag/v0.5.0)
+### [0.5.0 <sub><sup>BETA4</sup></sub>](https://web.archive.org/web/20241127121952/https://github.com/Gourieff/comfyui-reactor-node/releases/tag/v0.5.0)
 
 - Spandrel lib support for GFPGAN
 
@@ -163,7 +199,7 @@ Use this Node to gain the best results of the face swapping process:
 
 - Little speed boost when analyzing target images (unfortunately it is still quite slow in compare to swapping and restoring...)
 
-### [0.4.2](https://github.com/Gourieff/comfyui-reactor-node/releases/tag/v0.4.2)
+### [0.4.2](https://web.archive.org/web/20241127034727/https://github.com/Gourieff/comfyui-reactor-node/releases/tag/v0.4.2)
 
 - GPEN-BFR-512 and RestoreFormer_Plus_Plus face restoration models support
 
@@ -186,12 +222,12 @@ Result example (the new face was created from 4 faces of different actresses):
 
 Basic workflow [💾](https://github.com/Gourieff/Assets/blob/main/comfyui-reactor-node/workflows/ReActor--Build-Blended-Face-Model--v1.json)
 
-### [0.4.1](https://github.com/Gourieff/comfyui-reactor-node/releases/tag/v0.4.1)
+### [0.4.1](https://web.archive.org/web/20241127044707/https://github.com/Gourieff/comfyui-reactor-node/releases/tag/v0.4.1)
 
 - CUDA 12 Support - don't forget to run (Windows) `install.bat` or (Linux/MacOS) `install.py` for ComfyUI's Python enclosure or try to install ORT-GPU for CU12 manually (https://onnxruntime.ai/docs/install/#install-onnx-runtime-gpu-cuda-12x)
-- Issue https://github.com/Gourieff/comfyui-reactor-node/issues/173 fix
+- Issue [comfyui-reactor-node/issues/173](https://web.archive.org/web/20240919043728/https://github.com/Gourieff/comfyui-reactor-node/issues/173) fix
 
-- Separate Node for the Face Restoration postprocessing (FR https://github.com/Gourieff/comfyui-reactor-node/issues/191), can be found inside ReActor's menu (RestoreFace Node)
+- Separate Node for the Face Restoration postprocessing (FR [comfyui-reactor-node/issues/191](https://web.archive.org/web/20241127040848/https://github.com/Gourieff/comfyui-reactor-node/issues/191)), can be found inside ReActor's menu (RestoreFace Node)
 - (Windows) Installation can be done for Python from the System's PATH
 - Different fixes and improvements
 
@@ -199,7 +235,7 @@ Basic workflow [💾](https://github.com/Gourieff/Assets/blob/main/comfyui-react
 
 <img src="https://github.com/Gourieff/Assets/blob/main/comfyui-reactor-node/0.4.1-whatsnew-01.jpg?raw=true" alt="0.4.1-whatsnew-01" width="100%"/>
 
-### [0.4.0](https://github.com/Gourieff/comfyui-reactor-node/releases/tag/v0.4.0)
+### [0.4.0](https://web.archive.org/web/20241119155323/https://github.com/Gourieff/comfyui-reactor-node/releases/tag/v0.4.0)
 
 - Input "input_image" goes first now, it gives a correct bypass and also it is right to have the main input first;
 - You can now save face models as "safetensors" files (`ComfyUI\models\reactor\faces`) and load them into ReActor implementing different scenarios and keeping super lightweight face models of the faces you use:
@@ -235,6 +271,16 @@ Thanks to everyone who finds bugs, suggests new features and supports this proje
 5. Run ComfyUI and find there ReActor Nodes inside the menu `ReActor` or by using a search
 
 </details>
+
+## Models
+
+ - buffalo_l: downloaded on first launch into `ComfyUI\models\insightface\models\buffalo_l`, or you can download manually from [here](https://huggingface.co/datasets/Gourieff/ReActor/tree/main/models)
+ - inswapper_128: downloaded during installation into `ComfyUI\models\insightface`, or you can download manually from [here](https://huggingface.co/datasets/Gourieff/ReActor/tree/main/models)
+ - reswapper_128/256: https://huggingface.co/datasets/Gourieff/ReActor/tree/main/models put them into `ComfyUI\models\reswapper`
+ - hyperswap_256: https://huggingface.co/facefusion/models-3.3.0/tree/main (hyperswap_1a_256.onnx, hyperswap_1b_256.onnx, hyperswap_1a_256.onnx) put them into `ComfyUI\models\hyperswap`
+ - Face restoration models: https://huggingface.co/datasets/Gourieff/ReActor/tree/main/models/facerestore_models put any you like into `ComfyUI\models\facerestore_models`
+ - Ultralytics model: https://huggingface.co/datasets/Gourieff/ReActor/blob/main/models/detection/bbox/face_yolov8m.pt put into `ComfyUI\models\ultralytics\bbox`
+ - SAM models: https://huggingface.co/datasets/Gourieff/ReActor/tree/main/models/sams put into `ComfyUI\models\sams`
 
 ## Usage
 
@@ -338,17 +384,15 @@ You can set the strength of face swap for `source_image` or `face_model` from 0%
 ### **I. (For Windows users) If you still cannot build Insightface for some reasons or just don't want to install Visual Studio or VS C++ Build Tools - do the following:**
 
 1. (ComfyUI Portable) From the root folder check the version of Python:<br>run CMD and type `python_embeded\python.exe -V`
-2. Download prebuilt Insightface package [for Python 3.10](https://github.com/Gourieff/Assets/raw/main/Insightface/insightface-0.7.3-cp310-cp310-win_amd64.whl) or [for Python 3.11](https://github.com/Gourieff/Assets/raw/main/Insightface/insightface-0.7.3-cp311-cp311-win_amd64.whl) (if in the previous step you see 3.11) or [for Python 3.12](https://github.com/Gourieff/Assets/raw/main/Insightface/insightface-0.7.3-cp312-cp312-win_amd64.whl) (if in the previous step you see 3.12) and put into the stable-diffusion-webui (A1111 or SD.Next) root folder (where you have "webui-user.bat" file) or into ComfyUI root folder if you use ComfyUI Portable
-3. From the root folder run:
-   - (SD WebUI) CMD and `.\venv\Scripts\activate`
-   - (ComfyUI Portable) run CMD
-4. Then update your PIP:
-   - (SD WebUI) `python -m pip install -U pip`
-   - (ComfyUI Portable) `python_embeded\python.exe -m pip install -U pip`
-5. Then install Insightface:
-   - (SD WebUI) `pip install insightface-0.7.3-cp310-cp310-win_amd64.whl` (for 3.10) or `pip install insightface-0.7.3-cp311-cp311-win_amd64.whl` (for 3.11) or `pip install insightface-0.7.3-cp312-cp312-win_amd64.whl` (for 3.12)
-   - (ComfyUI Portable) `python_embeded\python.exe -m pip install insightface-0.7.3-cp310-cp310-win_amd64.whl` (for 3.10) or `python_embeded\python.exe -m pip install insightface-0.7.3-cp311-cp311-win_amd64.whl` (for 3.11) or `python_embeded\python.exe -m pip install insightface-0.7.3-cp312-cp312-win_amd64.whl` (for 3.12)
-6. Enjoy!
+2. Download prebuilt Insightface package according to Python's version you see in the previous step: [for Python 3.10](https://github.com/Gourieff/Assets/raw/main/Insightface/insightface-0.7.3-cp310-cp310-win_amd64.whl), [for Python 3.11](https://github.com/Gourieff/Assets/raw/main/Insightface/insightface-0.7.3-cp311-cp311-win_amd64.whl), [for Python 3.12](https://github.com/Gourieff/Assets/raw/main/Insightface/insightface-0.7.3-cp312-cp312-win_amd64.whl), [for Python 3.13](https://github.com/Gourieff/Assets/raw/main/Insightface/insightface-0.7.3-cp313-cp313-win_amd64.whl) - and put into ComfyUI root folder if you use ComfyUI Portable
+3. Update your PIP:<br>
+   `python_embeded\python.exe -m pip install -U pip`
+4. Then install Insightface:
+  <br>(for 3.10) `python_embeded\python.exe -m pip install insightface-0.7.3-cp310-cp310-win_amd64.whl`
+  <br>(for 3.11) `python_embeded\python.exe -m pip install insightface-0.7.3-cp311-cp311-win_amd64.whl`
+  <br>(for 3.12) `python_embeded\python.exe -m pip install insightface-0.7.3-cp312-cp312-win_amd64.whl`
+  <br>(for 3.13) `python_embeded\python.exe -m pip install insightface-0.7.3-cp313-cp313-win_amd64.whl` 
+5. Enjoy!
 
 ### **II. "AttributeError: 'NoneType' object has no attribute 'get'"**
 
