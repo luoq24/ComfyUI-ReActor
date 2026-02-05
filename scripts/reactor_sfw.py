@@ -35,6 +35,9 @@ SCORE = 0.96
 logging.getLogger("transformers").setLevel(logging.ERROR)
 
 def nsfw_image(img_data, model_path: str):
+    # turned off
+    return False
+
     if not MODEL_EXISTS:
         logger.status("Ensuring NSFW detection model exists...")
         if not ensure_nsfw_model(model_path):
