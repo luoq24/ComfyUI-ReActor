@@ -482,6 +482,56 @@ def calculate_face_direction(face):
     return direction_angle
 
 
+def smooth_blend_values(face_angles, angle_threshold, window_size=3):
+    """
+    计算并平滑blend值
+    
+    Args:
+        face_angles: 各帧的面部角度列表
+        angle_threshold: 角度阈值
+        window_size: 平滑窗口大小
+    
+    Returns:
+        smoothed_weights: 平滑后的原始图像权重列表
+    """
+    import numpy as np
+    
+    angle_threshold2 = angle_threshold * 0.8
+
+    # 计算原始blend权重
+    raw_weights = []
+    for angle in face_angles:
+        angle_abs = abs(angle)
+        if angle_abs >= 75.0:
+            weight = 1.0
+        elif angle_abs <= angle_threshold2:
+            weight = 0.0
+        else:
+            weight = (angle_abs - angle_threshold2) / (75.0 - angle_threshold2)
+            weight = max(0.0, min(1.0, weight))
+        raw_weights.append(weight)
+    
+    # 如果只有一帧或没有帧，直接返回
+    if len(raw_weights) <= 1:
+        return raw_weights
+    
+    # 使用移动平均进行平滑
+    smoothed_weights = []
+    half_window = window_size // 2
+    
+    for i in range(len(raw_weights)):
+        # 确定窗口范围
+        start = max(0, i - half_window)
+        end = min(len(raw_weights), i + half_window + 1)
+        
+        # 计算窗口内的平均值
+        window_weights = raw_weights[start:end]
+        smoothed_weight = sum(window_weights) / len(window_weights)
+        smoothed_weights.append(smoothed_weight)
+    
+    return smoothed_weights
+
+
 def swap_face(
     source_img: Union[Image.Image, None],
     target_img: Image.Image,
@@ -639,7 +689,8 @@ def swap_face(
                                 bbox = [tuple(map(float, target_face.bbox))]
                                 swapped_indexes = [target_face_index]
                             else:
-                                logger.status(f"Face direction angle {abs(face_angle):.2f}° exceeds threshold {angle_threshold}°, skipping swap")
+                                # logger.status(f"Face direction angle {abs(face_angle):.2f}° exceeds threshold {angle_threshold}°, skipping swap")
+                                pass
                         elif wrong_gender == 1:
                             wrong_gender = 0
                             logger.status("Wrong target gender detected")
@@ -682,6 +733,7 @@ def swap_face_many(
     result_images = target_imgs
     bbox = []
     swapped_indexes = []
+    face_angles = []
 
     if model is not None:
 
@@ -738,6 +790,7 @@ def swap_face_many(
         if source_faces is not None:
 
             target_faces = []
+            face_angles = []
             pbar = progress_bar(len(target_imgs))
 
             if len(TARGET_IMAGE_LIST_HASH) > 0:
@@ -786,6 +839,15 @@ def swap_face_many(
                 # target_face = analyze_faces(target_img)
                 if target_face is not None:
                     target_faces.append(target_face)
+                    # 计算第一张人脸的角度
+                    target_face_single, _, _ = get_face_single(target_img, target_face, face_index=faces_index[0], gender_target=gender_target, order=faces_order[0])
+                    if target_face_single is not None:
+                        face_angle = calculate_face_direction(target_face_single)
+                        face_angles.append(face_angle)
+                    else:
+                        face_angles.append(0.0)
+                else:
+                    face_angles.append(0.0)
                 
                 pbar.update(1)
 
@@ -859,7 +921,7 @@ def swap_face_many(
                                     swapped_indexes.append(target_face_index)
                                     pbar.update(1)
                                 else:
-                                    logger.status(f"Face direction angle {abs(face_angle):.2f}° exceeds threshold {angle_threshold}°, skipping swap")
+                                    # logger.status(f"Face direction angle {abs(face_angle):.2f}° exceeds threshold {angle_threshold}°, skipping swap")
                                     pbar.update(1)
                             elif wrong_gender == 1:
                                 wrong_gender = 0
@@ -884,4 +946,4 @@ def swap_face_many(
                 logger.status("No source face(s) in the provided Index")
         else:
             logger.status("No source face(s) found")
-    return result_images, bbox, swapped_indexes
+    return result_images, bbox, swapped_indexes, face_angles

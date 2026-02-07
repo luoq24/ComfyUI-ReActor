@@ -36,6 +36,7 @@ from scripts.reactor_faceswap import (
 )
 from scripts.reactor_swapper import (
     unload_all_models,
+    smooth_blend_values,
 )
 from scripts.reactor_logger import logger
 from reactor_utils import (
@@ -499,6 +500,32 @@ class reactor:
 
             if self.restore or not self.face_boost_enabled:
                 result = reactor.restore_face(self,result,face_restore_model,face_restore_visibility,codeformer_weight,facedetection)
+
+            # 应用平滑blend
+            if hasattr(p, 'face_angles') and len(p.face_angles) > 0 and len(original_image) == len(p.face_angles):
+                logger.status("Applying smooth blend based on face angles...")
+                smoothed_weights = smooth_blend_values(p.face_angles, angle_threshold, window_size=5)
+                
+                # 在float32格式下进行blend操作，避免精度损失
+                result_np = result.cpu().numpy().astype(np.float32)
+                original_np = original_image.cpu().numpy().astype(np.float32)
+                
+                blended_results = []
+                for i, (result_img, orig_img, weight) in enumerate(zip(result_np, original_np, smoothed_weights)):
+                    if weight > 0.01:
+                        blended = orig_img * weight + result_img * (1.0 - weight)
+                        blended_results.append(blended)
+                        # logger.info(f"Frame {i}: angle={p.face_angles[i]:.1f}°, original_weight={weight:.3f}")
+                    else:
+                        blended_results.append(result_img)
+                
+                # 打印各帧的最终blend系数
+                weight_str = ",".join([f"{w:.1f}" for w in smoothed_weights])
+                logger.status(f"Final blend weights: {weight_str}")
+                
+                # 转换回tensor
+                blended_np = np.array(blended_results).astype(np.float32)
+                result = torch.from_numpy(blended_np).to(result.device)
 
         else:
             image_black = Image.new("RGB", (512, 512))
