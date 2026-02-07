@@ -375,6 +375,113 @@ def get_face_single(img_data: np.ndarray, face, face_index=0, det_size=(640, 640
         return None, 0, None
 
 
+def calculate_face_direction(face):
+    """计算面部朝向角度"""
+    import numpy as np
+
+    # 获取面部关键点
+    kps = getattr(face, 'landmark_5', None)
+    if kps is None:
+        kps = getattr(face, 'kps', None)
+    if kps is None:
+        kps = getattr(face, 'landmark', None)
+        if kps is not None and len(kps) >= 5:
+            # 如果是68点，取前5个关键点位
+            kps = kps[:5]
+
+    if kps is None or len(kps) < 5:
+        return 0.0
+
+    # 关键点索引：0=左眼，1=右眼，2=鼻子，3=左嘴角，4=右嘴角
+    left_eye = kps[0]
+    right_eye = kps[1]
+    nose = kps[2]
+
+    # 计算两眼之间的向量
+    eye_vector = np.array(right_eye) - np.array(left_eye)
+    # 计算鼻子到两眼中点的向量
+    eye_midpoint = (np.array(left_eye) + np.array(right_eye)) / 2
+    nose_vector = np.array(nose) - eye_midpoint
+
+    # 计算面部宽度和高度
+    face_width = np.linalg.norm(eye_vector)
+    face_height = np.linalg.norm(nose_vector)
+
+    # 分析面部关键点，确定可见面部面积
+    left_eye = np.array(kps[0])
+    right_eye = np.array(kps[1])
+    nose = np.array(kps[2])
+    left_mouth = np.array(kps[3])
+    right_mouth = np.array(kps[4])
+
+    # 计算面部中心点
+    face_center = (left_eye + right_eye + nose + left_mouth + right_mouth) / 5
+
+    # 计算面部边界框
+    face_points = np.array([left_eye, right_eye, nose, left_mouth, right_mouth])
+    min_x = np.min(face_points[:, 0])
+    max_x = np.max(face_points[:, 0])
+    face_width_actual = max_x - min_x
+
+    # 计算左右面部的可见程度
+    left_face_points = [left_eye, left_mouth]
+    right_face_points = [right_eye, right_mouth]
+
+    # 计算左侧面部点到中心的平均距离
+    left_distances = [np.linalg.norm(p - face_center) for p in left_face_points]
+    avg_left_distance = np.mean(left_distances)
+
+    # 计算右侧面部点到中心的平均距离
+    right_distances = [np.linalg.norm(p - face_center) for p in right_face_points]
+    avg_right_distance = np.mean(right_distances)
+
+    # 计算面部方向：基于左右面部可见程度
+    visibility_ratio = (avg_right_distance - avg_left_distance) / (max(avg_left_distance, avg_right_distance) + 1e-6)
+
+    # 计算面部的宽高比，用于判断正面还是侧面
+    width_height_ratio = face_width / (face_height + 1e-6)
+
+    # 方法1：基于宽高比的角度计算（主要因素）
+    if width_height_ratio > 1.5:
+        # 正面
+        angle_from_ratio = 0.0
+    elif width_height_ratio < 0.9:
+        # 侧脸
+        angle_from_ratio = 85.0
+    else:
+        # 中间状态
+        angle_from_ratio = (1.5 - width_height_ratio) / (1.5 - 0.9) * 85.0
+
+    # 方法2：基于可见度比例的角度增强
+    visibility_strength = min(abs(visibility_ratio) * 3.0, 1.0)
+    angle_from_visibility = 85.0 * visibility_strength
+
+    # 综合两种方法，偏向于较大的角度
+    base_angle = max(angle_from_ratio, angle_from_visibility)
+
+    # 强制增强：对于明显的侧脸，确保角度足够大
+    if width_height_ratio < 1.1 or abs(visibility_ratio) > 0.3:
+        base_angle = max(base_angle, 75.0)
+
+    # 计算最终角度
+    if base_angle < 5.0 and abs(visibility_ratio) < 0.1:
+        # 接近正面
+        direction_angle = 0.0
+    else:
+        # 根据可见度比例确定方向和角度大小
+        if visibility_ratio > 0:
+            # 右脸更多
+            direction_angle = base_angle
+        elif visibility_ratio < 0:
+            # 左脸更多
+            direction_angle = -base_angle
+        else:
+            # 左右脸相当
+            direction_angle = 0.0
+
+    return direction_angle
+
+
 def swap_face(
     source_img: Union[Image.Image, None],
     target_img: Image.Image,
@@ -390,6 +497,7 @@ def swap_face(
     face_restore_visibility: int = 1,
     codeformer_weight: float = 0.5,
     interpolation: str = "Bicubic",
+    angle_threshold: float = 60.0,
 ):
     global SOURCE_FACES, SOURCE_IMAGE_HASH, TARGET_FACES, TARGET_IMAGE_HASH
     result_image = target_img
@@ -512,21 +620,26 @@ def swap_face(
                     if source_face is not None and src_wrong_gender == 0:
                         target_face, wrong_gender, target_face_index = get_face_single(target_img, target_faces, face_index=face_num, gender_target=gender_target, order=faces_order[0])
                         if target_face is not None and wrong_gender == 0:
-                            logger.status(f"Swapping...")
-                            if "hyperswap" in model:
-                                swapped_face_256, M = run_hyperswap(face_swapper, source_face, target_face, result)
-                                if swapped_face_256 is not None:
-                                    result = paste_back(result, swapped_face_256, M, crop_size=256)
-                            elif face_boost_enabled:
-                                logger.status(f"Face Boost is enabled (inswapper/reswapper only)")
-                                bgr_fake, M = face_swapper.get(result, target_face, source_face, paste_back=False)
-                                bgr_fake, scale = restorer.get_restored_face(bgr_fake, face_restore_model, face_restore_visibility, codeformer_weight, interpolation)
-                                M *= scale
-                                result = swapper.in_swap(result, bgr_fake, M)
+                            # 检查面部方向
+                            face_angle = calculate_face_direction(target_face)
+                            if abs(face_angle) <= angle_threshold:
+                                logger.status(f"Swapping...")
+                                if "hyperswap" in model:
+                                    swapped_face_256, M = run_hyperswap(face_swapper, source_face, target_face, result)
+                                    if swapped_face_256 is not None:
+                                        result = paste_back(result, swapped_face_256, M, crop_size=256)
+                                elif face_boost_enabled:
+                                    logger.status(f"Face Boost is enabled (inswapper/reswapper only)")
+                                    bgr_fake, M = face_swapper.get(result, target_face, source_face, paste_back=False)
+                                    bgr_fake, scale = restorer.get_restored_face(bgr_fake, face_restore_model, face_restore_visibility, codeformer_weight, interpolation)
+                                    M *= scale
+                                    result = swapper.in_swap(result, bgr_fake, M)
+                                else:
+                                    result = face_swapper.get(result, target_face, source_face)
+                                bbox = [tuple(map(float, target_face.bbox))]
+                                swapped_indexes = [target_face_index]
                             else:
-                                result = face_swapper.get(result, target_face, source_face)
-                            bbox = [tuple(map(float, target_face.bbox))]
-                            swapped_indexes = [target_face_index]
+                                logger.status(f"Face direction angle {abs(face_angle):.2f}° exceeds threshold {angle_threshold}°, skipping swap")
                         elif wrong_gender == 1:
                             wrong_gender = 0
                             logger.status("Wrong target gender detected")
@@ -563,6 +676,7 @@ def swap_face_many(
     face_restore_visibility: int = 1,
     codeformer_weight: float = 0.5,
     interpolation: str = "Bicubic",
+    angle_threshold: float = 60.0,
 ):
     global SOURCE_FACES, SOURCE_IMAGE_HASH, TARGET_FACES, TARGET_IMAGE_HASH, TARGET_FACES_LIST, TARGET_IMAGE_LIST_HASH
     result_images = target_imgs
@@ -724,23 +838,29 @@ def swap_face_many(
                         for i, (target_img, target_face) in enumerate(zip(results, target_faces)):
                             target_face_single, wrong_gender, target_face_index = get_face_single(target_img, target_face, face_index=face_num, gender_target=gender_target, order=faces_order[0])
                             if target_face_single is not None and wrong_gender == 0:
-                                result = target_img
-                                if "hyperswap" in model:
-                                    swapped_face_256, M = run_hyperswap(face_swapper, source_face, target_face_single, result)
-                                    if swapped_face_256 is not None:
-                                        result = paste_back(result, swapped_face_256, M, crop_size=256)
-                                elif face_boost_enabled:
-                                    logger.status(f"Face Boost is enabled (inswapper/reswapper only)")
-                                    bgr_fake, M = face_swapper.get(target_img, target_face_single, source_face, paste_back=False)
-                                    bgr_fake, scale = restorer.get_restored_face(bgr_fake, face_restore_model, face_restore_visibility, codeformer_weight, interpolation)
-                                    M *= scale
-                                    result = swapper.in_swap(target_img, bgr_fake, M)
+                                # 检查面部方向
+                                face_angle = calculate_face_direction(target_face_single)
+                                if abs(face_angle) <= angle_threshold:
+                                    result = target_img
+                                    if "hyperswap" in model:
+                                        swapped_face_256, M = run_hyperswap(face_swapper, source_face, target_face_single, result)
+                                        if swapped_face_256 is not None:
+                                            result = paste_back(result, swapped_face_256, M, crop_size=256)
+                                    elif face_boost_enabled:
+                                        logger.status(f"Face Boost is enabled (inswapper/reswapper only)")
+                                        bgr_fake, M = face_swapper.get(target_img, target_face_single, source_face, paste_back=False)
+                                        bgr_fake, scale = restorer.get_restored_face(bgr_fake, face_restore_model, face_restore_visibility, codeformer_weight, interpolation)
+                                        M *= scale
+                                        result = swapper.in_swap(target_img, bgr_fake, M)
+                                    else:
+                                        result = face_swapper.get(target_img, target_face_single, source_face)
+                                    results[i] = result
+                                    bbox.append(tuple(map(float, target_face_single.bbox)))
+                                    swapped_indexes.append(target_face_index)
+                                    pbar.update(1)
                                 else:
-                                    result = face_swapper.get(target_img, target_face_single, source_face)
-                                results[i] = result
-                                bbox.append(tuple(map(float, target_face_single.bbox)))
-                                swapped_indexes.append(target_face_index)
-                                pbar.update(1)
+                                    logger.status(f"Face direction angle {abs(face_angle):.2f}° exceeds threshold {angle_threshold}°, skipping swap")
+                                    pbar.update(1)
                             elif wrong_gender == 1:
                                 wrong_gender = 0
                                 logger.status("Wrong target gender detected")

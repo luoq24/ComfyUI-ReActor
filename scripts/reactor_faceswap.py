@@ -60,6 +60,7 @@ class FaceSwapScript(scripts.Script):
         face_restore_visibility,
         codeformer_weight,
         interpolation,
+        angle_threshold=60.0,
     ):
         self.enable = enable
         if self.enable:
@@ -108,42 +109,44 @@ class FaceSwapScript(scripts.Script):
                 if len(p.init_images) == 1:
 
                     result, bbox, swapped_indexes = swap_face(
-                        self.source,
-                        p.init_images[0],
-                        source_faces_index=self.source_faces_index,
-                        faces_index=self.faces_index,
-                        model=self.model,
-                        gender_source=self.gender_source,
-                        gender_target=self.gender_target,
-                        face_model=self.face_model,
-                        faces_order=self.faces_order,
-                        face_boost_enabled=self.face_boost_enabled,
-                        face_restore_model=self.face_restore_model,
-                        face_restore_visibility=self.face_restore_visibility,
-                        codeformer_weight=self.codeformer_weight,
-                        interpolation=self.interpolation,
-                    )
+                            self.source,
+                            p.init_images[0],
+                            source_faces_index=self.source_faces_index,
+                            faces_index=self.faces_index,
+                            model=self.model,
+                            gender_source=self.gender_source,
+                            gender_target=self.gender_target,
+                            face_model=self.face_model,
+                            faces_order=self.faces_order,
+                            face_boost_enabled=self.face_boost_enabled,
+                            face_restore_model=self.face_restore_model,
+                            face_restore_visibility=self.face_restore_visibility,
+                            codeformer_weight=self.codeformer_weight,
+                            interpolation=self.interpolation,
+                            angle_threshold=angle_threshold,
+                        )
                     p.init_images[0] = result
                     p.bbox = bbox
                     p.swapped_indexes = swapped_indexes
 
                 elif len(p.init_images) > 1:
                     result, bbox, swapped_indexes = swap_face_many(
-                        self.source,
-                        p.init_images,
-                        source_faces_index=self.source_faces_index,
-                        faces_index=self.faces_index,
-                        model=self.model,
-                        gender_source=self.gender_source,
-                        gender_target=self.gender_target,
-                        face_model=self.face_model,
-                        faces_order=self.faces_order,
-                        face_boost_enabled=self.face_boost_enabled,
-                        face_restore_model=self.face_restore_model,
-                        face_restore_visibility=self.face_restore_visibility,
-                        codeformer_weight=self.codeformer_weight,
-                        interpolation=self.interpolation,
-                    )
+                            self.source,
+                            p.init_images,
+                            source_faces_index=self.source_faces_index,
+                            faces_index=self.faces_index,
+                            model=self.model,
+                            gender_source=self.gender_source,
+                            gender_target=self.gender_target,
+                            face_model=self.face_model,
+                            faces_order=self.faces_order,
+                            face_boost_enabled=self.face_boost_enabled,
+                            face_restore_model=self.face_restore_model,
+                            face_restore_visibility=self.face_restore_visibility,
+                            codeformer_weight=self.codeformer_weight,
+                            interpolation=self.interpolation,
+                            angle_threshold=angle_threshold,
+                        )
                     p.init_images = result
                     p.bbox = bbox
                     p.swapped_indexes = swapped_indexes
