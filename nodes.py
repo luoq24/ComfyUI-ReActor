@@ -504,7 +504,7 @@ class reactor:
             # 应用平滑blend
             if hasattr(p, 'face_angles') and len(p.face_angles) > 0 and len(original_image) == len(p.face_angles):
                 logger.status("Applying smooth blend based on face angles...")
-                smoothed_weights = smooth_blend_values(p.face_angles, angle_threshold, window_size=5)
+                smoothed_weights = smooth_blend_values(p.face_angles, angle_threshold)
                 
                 # 在float32格式下进行blend操作，避免精度损失
                 result_np = result.cpu().numpy().astype(np.float32)
@@ -519,9 +519,9 @@ class reactor:
                     else:
                         blended_results.append(result_img)
                 
-                # 打印各帧的最终blend系数
-                weight_str = ",".join([f"{w:.1f}" for w in smoothed_weights])
-                logger.status(f"Final blend weights: {weight_str}")
+                # 打印各帧的角度和blend系数
+                angle_weight_str = ",".join([f"{a:.1f}-{w:.1f}" for a, w in zip(p.face_angles, smoothed_weights)])
+                logger.status(f"Angles & weights: {angle_weight_str}")
                 
                 # 转换回tensor
                 blended_np = np.array(blended_results).astype(np.float32)

@@ -378,6 +378,9 @@ def get_face_single(img_data: np.ndarray, face, face_index=0, det_size=(640, 640
 def calculate_face_direction(face):
     """计算面部朝向角度（综合左右和上下偏转）"""
     import numpy as np
+    
+    # 调试开关：True=开启调试打印，False=关闭调试打印
+    DEBUG_MODE = False
 
     # 获取面部关键点
     kps = getattr(face, 'landmark_5', None)
@@ -390,7 +393,13 @@ def calculate_face_direction(face):
             kps = kps[:5]
 
     if kps is None or len(kps) < 5:
+        if DEBUG_MODE:
+            print("[DEBUG] No valid face landmarks found")
         return 0.0
+    
+    # 打印关键点信息
+    if DEBUG_MODE:
+        print(f"[DEBUG] Face landmarks: {kps}")
 
     # 关键点索引：0=左眼，1=右眼，2=鼻子，3=左嘴角，4=右嘴角
     left_eye = np.array(kps[0])
@@ -440,6 +449,10 @@ def calculate_face_direction(face):
     # 计算面部的宽高比，用于判断正面还是侧面
     width_height_ratio = face_width / (face_height + 1e-6)
 
+    # 打印宽高比信息
+    if DEBUG_MODE:
+        print(f"[DEBUG] Width/height ratio: {width_height_ratio:.2f}")
+    
     # 方法1：基于宽高比的角度计算（主要因素）
     if width_height_ratio > 1.5:
         # 正面
@@ -450,10 +463,17 @@ def calculate_face_direction(face):
     else:
         # 中间状态
         angle_from_ratio = (1.5 - width_height_ratio) / (1.5 - 0.9) * 85.0
+    
+    if DEBUG_MODE:
+        print(f"[DEBUG] Angle from ratio: {angle_from_ratio:.2f}")
 
     # 方法2：基于可见度比例的角度增强
     visibility_strength = min(abs(horizontal_visibility_ratio) * 3.0, 1.0)
     angle_from_visibility = 85.0 * visibility_strength
+    
+    if DEBUG_MODE:
+        print(f"[DEBUG] Horizontal visibility ratio: {horizontal_visibility_ratio:.2f}")
+        print(f"[DEBUG] Angle from visibility: {angle_from_visibility:.2f}")
 
     # 综合两种方法，偏向于较大的角度
     horizontal_base_angle = max(angle_from_ratio, angle_from_visibility)
@@ -486,6 +506,10 @@ def calculate_face_direction(face):
     eye_nose_distance = np.linalg.norm(nose - eye_midpoint)
     nose_mouth_distance = np.linalg.norm(mouth_midpoint - nose)
     vertical_ratio = eye_nose_distance / (nose_mouth_distance + 1e-6)
+    
+    if DEBUG_MODE:
+        print(f"[DEBUG] Eye-nose distance: {eye_nose_distance:.2f}, Nose-mouth distance: {nose_mouth_distance:.2f}")
+        print(f"[DEBUG] Vertical ratio: {vertical_ratio:.2f}")
 
     # 方法2：基于上下面部关键点到中心的距离
     upper_face_points = [left_eye, right_eye, nose]
@@ -498,62 +522,75 @@ def calculate_face_direction(face):
     avg_lower_distance = np.mean(lower_distances)
 
     vertical_visibility_ratio = (avg_lower_distance - avg_upper_distance) / (max(avg_upper_distance, avg_lower_distance) + 1e-6)
+    
+    if DEBUG_MODE:
+        print(f"[DEBUG] Avg upper distance: {avg_upper_distance:.2f}, Avg lower distance: {avg_lower_distance:.2f}")
+        print(f"[DEBUG] Vertical visibility ratio: {vertical_visibility_ratio:.2f}")
 
     # 方法3：基于面部实际宽高比
     face_aspect_ratio = face_width_actual / (face_height_actual + 1e-6)
+    
+    if DEBUG_MODE:
+        print(f"[DEBUG] Face aspect ratio: {face_aspect_ratio:.2f}")
 
     # 综合计算上下偏转角度
     # 正常情况下，眼睛到鼻子和鼻子到嘴巴的距离比例约为0.8-1.2
-    if vertical_ratio < 0.6 or vertical_ratio > 1.8:
+    # 进一步调整阈值为更宽松的范围
+    if vertical_ratio < 0.3 or vertical_ratio > 3.0:
         # 明显的抬头或低头
         vertical_angle_from_ratio = 85.0
-    elif 0.8 <= vertical_ratio <= 1.2:
+    elif 0.5 <= vertical_ratio <= 2.2:
         # 正常范围
         vertical_angle_from_ratio = 0.0
     else:
         # 中间状态
-        if vertical_ratio < 0.8:
+        if vertical_ratio < 0.5:
             # 抬头
-            vertical_angle_from_ratio = (0.8 - vertical_ratio) / (0.8 - 0.6) * 85.0
+            vertical_angle_from_ratio = (0.5 - vertical_ratio) / (0.5 - 0.3) * 85.0
         else:
             # 低头
-            vertical_angle_from_ratio = (vertical_ratio - 1.2) / (1.8 - 1.2) * 85.0
+            vertical_angle_from_ratio = (vertical_ratio - 2.2) / (3.0 - 2.2) * 85.0
 
     # 基于可见度比例的角度增强
-    vertical_visibility_strength = min(abs(vertical_visibility_ratio) * 2.5, 1.0)
+    vertical_visibility_strength = min(abs(vertical_visibility_ratio) * 2.0, 1.0)
     vertical_angle_from_visibility = 85.0 * vertical_visibility_strength
 
     # 基于宽高比的角度增强（抬头时脸部变窄，低头时变宽）
-    if face_aspect_ratio < 0.7:
+    if face_aspect_ratio < 0.6:
         # 抬头
-        vertical_angle_from_aspect = 85.0 * (1.0 - face_aspect_ratio / 0.7)
-    elif face_aspect_ratio > 1.3:
+        vertical_angle_from_aspect = 85.0 * (1.0 - face_aspect_ratio / 0.6)
+    elif face_aspect_ratio > 1.4:
         # 低头
-        vertical_angle_from_aspect = 85.0 * (face_aspect_ratio - 1.3) / 0.7
+        vertical_angle_from_aspect = 85.0 * (face_aspect_ratio - 1.4) / 0.6
     else:
         vertical_angle_from_aspect = 0.0
 
-    # 综合三种方法计算上下偏转
-    vertical_base_angle = max(vertical_angle_from_ratio, vertical_angle_from_visibility, vertical_angle_from_aspect)
+    # 综合三种方法计算上下偏转（进一步降低可见度和宽高比的权重）
+    vertical_base_angle = max(vertical_angle_from_ratio, vertical_angle_from_visibility * 0.3, vertical_angle_from_aspect * 0.2)
 
     # 确定上下偏转方向
-    if vertical_base_angle < 5.0 and abs(vertical_visibility_ratio) < 0.1 and 0.8 <= vertical_ratio <= 1.2:
+    if vertical_base_angle < 5.0 and abs(vertical_visibility_ratio) < 0.2 and 0.5 <= vertical_ratio <= 2.2:
         # 接近正面
         vertical_angle = 0.0
     else:
         # 根据可见度比例和距离比例确定方向
-        if vertical_visibility_ratio > 0.15 or vertical_ratio < 0.9:
+        if vertical_visibility_ratio > 0.25 or vertical_ratio < 0.6:
             # 下巴更多/抬头
             vertical_angle = vertical_base_angle
-        elif vertical_visibility_ratio < -0.15 or vertical_ratio > 1.3:
+        elif vertical_visibility_ratio < -0.25 or vertical_ratio > 2.1:
             # 额头更多/低头
             vertical_angle = -vertical_base_angle
         else:
             vertical_angle = 0.0
 
     # ============ 综合左右和上下角度 ============
+    # 综合左右和上下角度
     # 使用欧几里得距离综合两个维度的角度
     combined_angle = np.sqrt(horizontal_angle ** 2 + vertical_angle ** 2)
+    
+    if DEBUG_MODE:
+        print(f"[DEBUG] Horizontal angle: {horizontal_angle:.2f}, Vertical angle: {vertical_angle:.2f}")
+        print(f"[DEBUG] Combined angle: {combined_angle:.2f}")
 
     return combined_angle
 
@@ -572,18 +609,18 @@ def smooth_blend_values(face_angles, angle_threshold, window_size=3):
     """
     import numpy as np
     
-    angle_threshold2 = angle_threshold * 0.8
+    angle_threshold2 = angle_threshold
 
     # 计算原始blend权重
     raw_weights = []
     for angle in face_angles:
         angle_abs = abs(angle)
-        if angle_abs >= 75.0:
+        if angle_abs >= 85.0:
             weight = 1.0
         elif angle_abs <= angle_threshold2:
             weight = 0.0
         else:
-            weight = (angle_abs - angle_threshold2) / (75.0 - angle_threshold2)
+            weight = (angle_abs - angle_threshold2) / (85.0 - angle_threshold2)
             weight = max(0.0, min(1.0, weight))
         raw_weights.append(weight)
     
