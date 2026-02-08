@@ -375,12 +375,52 @@ def get_face_single(img_data: np.ndarray, face, face_index=0, det_size=(640, 640
         return None, 0, None
 
 
+def smooth_face_angles(face_angles, window_size=5, alpha=0.4):
+    """
+    对面部角度序列进行平滑处理，减少检测抖动
+    
+    Args:
+        face_angles: 原始角度列表
+        window_size: 中值滤波窗口大小
+        alpha: EWMA平滑系数，越小越平滑
+    
+    Returns:
+        smoothed_angles: 平滑后的角度列表
+    """
+    import numpy as np
+    
+    if len(face_angles) <= 1:
+        return face_angles.copy()
+    
+    angles = np.array(face_angles)
+    
+    # 第一步：中值滤波消除异常值
+    median_filtered = []
+    half_window = window_size // 2
+    
+    for i in range(len(angles)):
+        start = max(0, i - half_window)
+        end = min(len(angles), i + half_window + 1)
+        window_values = angles[start:end]
+        median_filtered.append(np.median(window_values))
+    
+    # 第二步：指数加权移动平均（EWMA）进一步平滑
+    smoothed = []
+    smoothed.append(median_filtered[0])
+    
+    for i in range(1, len(median_filtered)):
+        ewma = alpha * median_filtered[i] + (1 - alpha) * smoothed[-1]
+        smoothed.append(ewma)
+    
+    return smoothed
+
+
 def calculate_face_direction(face):
     """计算面部朝向角度（综合左右和上下偏转）"""
     import numpy as np
     
     # 调试开关：True=开启调试打印，False=关闭调试打印
-    DEBUG_MODE = False
+    DEBUG_MODE = True
 
     # 获取面部关键点
     kps = getattr(face, 'landmark_5', None)
@@ -536,20 +576,20 @@ def calculate_face_direction(face):
     # 综合计算上下偏转角度
     # 正常情况下，眼睛到鼻子和鼻子到嘴巴的距离比例约为0.8-1.2
     # 进一步调整阈值为更宽松的范围
-    if vertical_ratio < 0.3 or vertical_ratio > 3.0:
+    if vertical_ratio < 0.15 or vertical_ratio > 6.0:
         # 明显的抬头或低头
         vertical_angle_from_ratio = 85.0
-    elif 0.5 <= vertical_ratio <= 2.2:
+    elif 0.25 <= vertical_ratio <= 5.5:
         # 正常范围
         vertical_angle_from_ratio = 0.0
     else:
         # 中间状态
-        if vertical_ratio < 0.5:
+        if vertical_ratio < 0.25:
             # 抬头
-            vertical_angle_from_ratio = (0.5 - vertical_ratio) / (0.5 - 0.3) * 85.0
+            vertical_angle_from_ratio = (0.25 - vertical_ratio) / (0.25 - 0.15) * 85.0
         else:
             # 低头
-            vertical_angle_from_ratio = (vertical_ratio - 2.2) / (3.0 - 2.2) * 85.0
+            vertical_angle_from_ratio = (vertical_ratio - 5.5) / (6.0 - 5.5) * 85.0
 
     # 基于可见度比例的角度增强
     vertical_visibility_strength = min(abs(vertical_visibility_ratio) * 2.0, 1.0)
@@ -569,15 +609,15 @@ def calculate_face_direction(face):
     vertical_base_angle = max(vertical_angle_from_ratio, vertical_angle_from_visibility * 0.3, vertical_angle_from_aspect * 0.2)
 
     # 确定上下偏转方向
-    if vertical_base_angle < 5.0 and abs(vertical_visibility_ratio) < 0.2 and 0.5 <= vertical_ratio <= 2.2:
+    if vertical_base_angle < 5.0 and abs(vertical_visibility_ratio) < 0.35 and 0.25 <= vertical_ratio <= 5.5:
         # 接近正面
         vertical_angle = 0.0
     else:
         # 根据可见度比例和距离比例确定方向
-        if vertical_visibility_ratio > 0.25 or vertical_ratio < 0.6:
+        if vertical_visibility_ratio > 0.4 or vertical_ratio < 0.3:
             # 下巴更多/抬头
             vertical_angle = vertical_base_angle
-        elif vertical_visibility_ratio < -0.25 or vertical_ratio > 2.1:
+        elif vertical_visibility_ratio < -0.4 or vertical_ratio > 5.0:
             # 额头更多/低头
             vertical_angle = -vertical_base_angle
         else:
@@ -980,10 +1020,14 @@ def swap_face_many(
 
             progress_bar_reset(pbar)
             
+            # 对角度序列进行平滑处理，减少检测抖动
+            smoothed_face_angles = smooth_face_angles(face_angles)
+            logger.status(f"Face angles smoothed. Original: {[f'{a:.1f}' for a in face_angles[:10]]}... -> Smoothed: {[f'{a:.1f}' for a in smoothed_face_angles[:10]]}...")
+            
             # No use in trying to swap faces if no faces are found, enhancement
             if len(target_faces) == 0:
                 logger.status("Cannot detect any Target, skipping swapping...")
-                return result_images, bbox, swapped_indexes
+                return result_images, bbox, swapped_indexes, face_angles
 
             if source_img is not None:
                 # separated management of wrong_gender between source and target, enhancement
@@ -1027,8 +1071,8 @@ def swap_face_many(
                         for i, (target_img, target_face) in enumerate(zip(results, target_faces)):
                             target_face_single, wrong_gender, target_face_index = get_face_single(target_img, target_face, face_index=face_num, gender_target=gender_target, order=faces_order[0])
                             if target_face_single is not None and wrong_gender == 0:
-                                # 检查面部方向
-                                face_angle = calculate_face_direction(target_face_single)
+                                # 使用平滑后的角度
+                                face_angle = smoothed_face_angles[i]
                                 if abs(face_angle) <= angle_threshold:
                                     result = target_img
                                     if "hyperswap" in model:
@@ -1073,4 +1117,4 @@ def swap_face_many(
                 logger.status("No source face(s) in the provided Index")
         else:
             logger.status("No source face(s) found")
-    return result_images, bbox, swapped_indexes, face_angles
+    return result_images, bbox, swapped_indexes, smoothed_face_angles
