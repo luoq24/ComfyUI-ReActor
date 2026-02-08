@@ -595,32 +595,42 @@ def calculate_face_direction(face):
     return combined_angle
 
 
-def smooth_blend_values(face_angles, angle_threshold, window_size=3):
+def smooth_blend_values(face_angles, angle_threshold, window_size=7, alpha=0.5):
     """
-    计算并平滑blend值
+    计算并平滑blend值（优化版）
     
     Args:
         face_angles: 各帧的面部角度列表
         angle_threshold: 角度阈值
-        window_size: 平滑窗口大小
+        window_size: 中值滤波窗口大小（默认7，更大窗口可以更好地消除波动）
+        alpha: EWMA平滑系数，越小越平滑（0.3-0.7推荐）
     
     Returns:
         smoothed_weights: 平滑后的原始图像权重列表
     """
     import numpy as np
     
-    angle_threshold2 = angle_threshold
+    # 设置平滑过渡区间（阈值前后5度）
+    transition_range = 5.0
+    transition_start = max(0, angle_threshold - transition_range)
+    transition_end = min(85.0, angle_threshold + transition_range)
 
-    # 计算原始blend权重
+    # 计算原始blend权重，使用平滑的sigmoid过渡曲线
     raw_weights = []
     for angle in face_angles:
         angle_abs = abs(angle)
-        if angle_abs >= 85.0:
+        if angle_abs >= 75.0:
             weight = 1.0
-        elif angle_abs <= angle_threshold2:
+        elif angle_abs <= angle_threshold:
             weight = 0.0
+        elif angle_abs >= transition_end:
+            # 过渡区间后段：线性过渡
+            weight = (angle_abs - transition_end) / (75.0 - transition_end)
+            weight = max(0.0, min(1.0, weight))
         else:
-            weight = (angle_abs - angle_threshold2) / (85.0 - angle_threshold2)
+            # 过渡区间前段：使用sigmoid平滑过渡
+            normalized = (angle_abs - angle_threshold) / transition_range
+            weight = normalized * normalized * (3 - 2 * normalized)  # smoothstep函数
             weight = max(0.0, min(1.0, weight))
         raw_weights.append(weight)
     
@@ -628,19 +638,23 @@ def smooth_blend_values(face_angles, angle_threshold, window_size=3):
     if len(raw_weights) <= 1:
         return raw_weights
     
-    # 使用移动平均进行平滑
-    smoothed_weights = []
+    # 第一步：中值滤波消除异常值
+    median_filtered = []
     half_window = window_size // 2
     
     for i in range(len(raw_weights)):
-        # 确定窗口范围
         start = max(0, i - half_window)
         end = min(len(raw_weights), i + half_window + 1)
-        
-        # 计算窗口内的平均值
-        window_weights = raw_weights[start:end]
-        smoothed_weight = sum(window_weights) / len(window_weights)
-        smoothed_weights.append(smoothed_weight)
+        window_values = raw_weights[start:end]
+        median_filtered.append(np.median(window_values))
+    
+    # 第二步：指数加权移动平均（EWMA）进一步平滑
+    smoothed_weights = []
+    smoothed_weights.append(median_filtered[0])
+    
+    for i in range(1, len(median_filtered)):
+        ewma = alpha * median_filtered[i] + (1 - alpha) * smoothed_weights[-1]
+        smoothed_weights.append(ewma)
     
     return smoothed_weights
 
