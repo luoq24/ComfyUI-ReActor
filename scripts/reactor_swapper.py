@@ -109,17 +109,34 @@ def getAnalysisModel(det_size = (640, 640)):
     ANALYSIS_MODELS[str(det_size[0])] = ANALYSIS_MODEL
     return ANALYSIS_MODEL
 
+# Кэш для типов моделей
+_MODEL_TYPE_CACHE = {}
+
+def _get_model_type(model_path: str):
+    """Кэшированный определение типа модели для оптимизации"""
+    if model_path not in _MODEL_TYPE_CACHE:
+        model_filename = os.path.basename(model_path).lower()
+        if "hyperswap" in model_filename:
+            _MODEL_TYPE_CACHE[model_path] = "hyperswap"
+        elif "reswapper" in model_filename:
+            _MODEL_TYPE_CACHE[model_path] = "reswapper"
+        else:
+            _MODEL_TYPE_CACHE[model_path] = "insightface"
+    return _MODEL_TYPE_CACHE[model_path]
+
 def getFaceSwapModel(model_path: str):
     global FS_MODEL, CURRENT_FS_MODEL_PATH
     if FS_MODEL is None or CURRENT_FS_MODEL_PATH is None or CURRENT_FS_MODEL_PATH != model_path:
         CURRENT_FS_MODEL_PATH = model_path
         FS_MODEL = unload_model(FS_MODEL)
 
+        model_type = _get_model_type(model_path)
         model_filename = os.path.basename(model_path)
-        if "hyperswap" in model_filename.lower():
+        
+        if model_type == "hyperswap":
             model_path = os.path.join(folder_paths.models_dir, "hyperswap", model_filename)
             FS_MODEL = ort.InferenceSession(model_path, providers=providers)
-        elif "reswapper" in model_filename.lower():
+        elif model_type == "reswapper":
             model_path = os.path.join(folder_paths.models_dir, "reswapper", model_filename)
             FS_MODEL = insightface.model_zoo.get_model(model_path, providers=providers)
         else:
@@ -145,8 +162,15 @@ def get_affine_transform(src_pts, dst_pts):
     M, _ = cv2.estimateAffinePartial2D(src_pts, dst_pts)
     return M
 
+# Кэш для масок разных размеров
+_GRADIENT_MASK_CACHE = {}
+
 # Создаём градиентную маску овальной формы без обрезки 
 def create_gradient_mask(crop_size=256):
+    # Используем кэш для избежания пересчёта маски одного размера
+    if crop_size in _GRADIENT_MASK_CACHE:
+        return _GRADIENT_MASK_CACHE[crop_size]
+    
     # 1. Создаём пустую маску (все пиксели = 0)
     mask = np.zeros((crop_size, crop_size), dtype=np.float32)
     
@@ -172,6 +196,9 @@ def create_gradient_mask(crop_size=256):
     
     # 5. Ограничим значения в диапазоне [0, 1]
     mask = np.clip(mask, 0, 1)
+    
+    # Сохраняем в кэш
+    _GRADIENT_MASK_CACHE[crop_size] = mask
     
     return mask
 
@@ -419,8 +446,7 @@ def calculate_face_direction(face):
     """计算面部朝向角度（综合左右和上下偏转）"""
     import numpy as np
     
-    # 调试开关：True=开启调试打印，False=关闭调试打印
-    DEBUG_MODE = True
+    DEBUG_MODE = False
 
     # 获取面部关键点
     kps = getattr(face, 'landmark_5', None)
