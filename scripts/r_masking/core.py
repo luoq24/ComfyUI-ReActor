@@ -280,19 +280,14 @@ def dilate_masks(segmasks, dilation_factor, iter=1):
     dilated_masks = []
     kernel = np.ones((abs(dilation_factor), abs(dilation_factor)), np.uint8)
 
-    kernel = cv2.UMat(kernel)
+    if dilation_factor > 0:
+        op = cv2.dilate
+    else:
+        op = cv2.erode
 
     for i in range(len(segmasks)):
         cv2_mask = segmasks[i][1]
-
-        cv2_mask = cv2.UMat(cv2_mask)
-
-        if dilation_factor > 0:
-            dilated_mask = cv2.dilate(cv2_mask, kernel, iter)
-        else:
-            dilated_mask = cv2.erode(cv2_mask, kernel, iter)
-
-        dilated_mask = dilated_mask.get()
+        dilated_mask = op(cv2_mask, kernel, iter)
 
         item = (segmasks[i][0], dilated_mask, segmasks[i][2])
         dilated_masks.append(item)
@@ -548,8 +543,8 @@ def make_sam_mask_segmented(sam_model, segs, image, detection_hint, dilation,
 
     try:
         predictor = SamPredictor(sam_model)
-        image = np.clip(255. * image.cpu().numpy().squeeze(), 0, 255).astype(np.uint8)
-        predictor.set_image(image, "RGB")
+        image_np = np.clip(255. * image.cpu().numpy().squeeze(), 0, 255).astype(np.uint8)
+        predictor.set_image(image_np, "RGB")
 
         total_masks = []
 
@@ -621,9 +616,10 @@ def make_sam_mask_segmented(sam_model, segs, image, detection_hint, dilation,
             kernel_size = 1 + abs(dilation) * 2
             mask = -torch.nn.functional.max_pool2d(-mask, kernel_size=kernel_size, stride=1, padding=abs(dilation))
         mask = mask.squeeze(0).squeeze(0)  # [H,W]
+        mask = mask.to(device=mask_working_device)
     else:
         # Extracting batch, height and width
-        height, width, _ = image.shape
+        height, width = image_np.shape[:2]
         mask = torch.zeros(
             (height, width), dtype=torch.float32, device=mask_working_device
         )  # empty mask

@@ -1277,6 +1277,7 @@ class MaskHelper:
         self.detection_hint = "center-1"
         self._sam_cache = {}
         self._bbox_cache = {}
+        self._blur_cache = {}
 
     @classmethod
     def INPUT_TYPES(s):
@@ -1316,12 +1317,9 @@ class MaskHelper:
     def execute(self, image, swapped_image, bbox_model_name, bbox_threshold, bbox_dilation, bbox_crop_factor, bbox_drop_size, sam_model_name, sam_dilation, sam_threshold, bbox_expansion, mask_hint_threshold, mask_hint_use_negative, morphology_operation, morphology_distance, blur_radius, sigma_factor, mask_optional=None):
         device = model_management.get_torch_device()
 
-        # Оптимально перемещаем тензоры
-        if isinstance(image, torch.Tensor) and image.device != device:
-            image = image.to(device)
-
-        if isinstance(swapped_image, torch.Tensor) and swapped_image.device != device:
-            swapped_image = swapped_image.to(device)
+        # Оптимально перемещаем тензоры - один раз в начале
+        image = image.to(device) if isinstance(image, torch.Tensor) and image.device != device else image
+        swapped_image = swapped_image.to(device) if isinstance(swapped_image, torch.Tensor) and swapped_image.device != device else swapped_image
 
         if mask_optional is not None:
             combined_mask = mask_optional
@@ -1363,8 +1361,7 @@ class MaskHelper:
                 for i in range(image.shape[0]):
                     segs_i = segs_all[i] if i < len(segs_all) else []
                     segs_tuple = ([segs_i], seg_labels) if isinstance(segs_i, dict) else (segs_i, seg_labels)
-                    image_device = image.to(device) if image.device != device else image
-                    image_i = image_device[i]
+                    image_i = image[i]
                     mask_i, _ = core.make_sam_mask_segmented(
                         sam, segs_tuple, image_i, self.detection_hint,
                         sam_dilation, sam_threshold, bbox_expansion,
@@ -1373,9 +1370,8 @@ class MaskHelper:
                     combined_masks.append(mask_i)
                 combined_mask = torch.stack(combined_masks)
             else:
-                image_device = image.to(device) if image.device != device else image
                 combined_mask, _ = core.make_sam_mask_segmented(
-                    sam, (segs_all, seg_labels), image_device, self.detection_hint,
+                    sam, (segs_all, seg_labels), image, self.detection_hint,
                     sam_dilation, sam_threshold, bbox_expansion,
                     mask_hint_threshold, mask_hint_use_negative
                 )
@@ -1394,7 +1390,10 @@ class MaskHelper:
 
         # Gaussian blur
         if blur_radius > 0:
-            blur = T.GaussianBlur(kernel_size=blur_radius * 2 + 1, sigma=sigma_factor)
+            blur_key = f"{blur_radius}_{sigma_factor}"
+            if blur_key not in self._blur_cache:
+                self._blur_cache[blur_key] = T.GaussianBlur(kernel_size=blur_radius * 2 + 1, sigma=sigma_factor)
+            blur = self._blur_cache[blur_key]
             mask_blurred = blur(combined_mask.unsqueeze(1)).squeeze(1)
         else:
             mask_blurred = combined_mask
@@ -1442,14 +1441,12 @@ class MaskHelper:
         use_width = int(torch.max(width).item())
         use_height = int(torch.max(height).item())
 
-        alpha_mask = torch.ones((B, H, W, 4))
+        alpha_mask = torch.ones((B, H, W, 4), device=device)
         alpha_mask[:,:,:,3] = mask
-
-        alpha_mask = alpha_mask.to(device) if alpha_mask.device != device else alpha_mask
 
         swapped_image = swapped_image * alpha_mask
 
-        cutted_image = torch.zeros((B, use_height, use_width, 4))
+        cutted_image = torch.zeros((B, use_height, use_width, 4), device=device)
         for i in range(0, B):
             if not is_empty[i]:
                 ymin = int(min_y[i].item())
@@ -1533,7 +1530,7 @@ class MaskHelper:
                 # Resize the image we're pasting if needed
                 resized_image = image_to_paste[i].unsqueeze(0)
 
-                pasting = torch.ones([H, W, C])
+                pasting = torch.ones([H, W, C], device=device)
                 ymid = float(mid_y[i].item())
                 ymin = int(math.floor(ymid - height / 2)) + 1
                 ymax = int(math.floor(ymid + height / 2)) + 1
@@ -1560,13 +1557,10 @@ class MaskHelper:
                 pasting[ymin:ymax, xmin:xmax, :] = resized_image[0, source_ymin:source_ymax, source_xmin:source_xmax, :]
                 pasting[:, :, 3] = 1.
 
-                pasting_alpha = torch.zeros([H, W])
+                pasting_alpha = torch.zeros([H, W], device=device)
                 pasting_alpha[ymin:ymax, xmin:xmax] = resized_image[0, source_ymin:source_ymax, source_xmin:source_xmax, 3]
 
                 paste_mask = torch.min(pasting_alpha, mask[i]).unsqueeze(2).repeat(1, 1, 4)
-
-                pasting = pasting.to(device) if pasting.device != device else pasting
-                paste_mask = paste_mask.to(device) if paste_mask.device != device else paste_mask
 
                 result[image_index] = pasting * paste_mask + result[image_index] * (1. - paste_mask)
 
@@ -1592,11 +1586,12 @@ class MaskHelper:
         if distance <= 0:
             return image
         image = image.unsqueeze(1)  # shape [B, 1, H, W] or [1, 1, H, W]
-        for _ in range(distance):
-            if op == "dilate":
-                image = F.max_pool2d(image, kernel_size=3, stride=1, padding=1)
-            elif op == "erode":
-                image = -F.max_pool2d(-image, kernel_size=3, stride=1, padding=1)
+        kernel_size = 2 * distance + 1
+        padding = distance
+        if op == "dilate":
+            image = F.max_pool2d(image, kernel_size=kernel_size, stride=1, padding=padding)
+        elif op == "erode":
+            image = -F.max_pool2d(-image, kernel_size=kernel_size, stride=1, padding=padding)
         return image.squeeze(1)
 
 
