@@ -1690,7 +1690,7 @@ class ReActorOptions:
                 "source_faces_index": ("STRING", {"default": "0"}),
                 "detect_gender_source": (["no","female","male"], {"default": "no"}),
                 "console_log_level": ([0, 1, 2], {"default": 1}),
-                "restore_swapped_only": ("BOOLEAN", {"default": True, "label_off": "no", "label_on": "yes"})
+                "restore_swapped_only": ("BOOLEAN", {"default": False, "label_off": "no", "label_on": "yes"})
             }
         }
 
