@@ -506,7 +506,7 @@ class reactor:
             if hasattr(p, 'face_angles') and len(p.face_angles) > 0 and len(original_image) == len(p.face_angles):
                 logger.status("Applying smooth blend based on face angles...")
                 # 对角度序列进行平滑处理，减少检测抖动
-                smoothed_angles = smooth_face_angles(p.face_angles)
+                smoothed_angles = p.face_angles
                 smoothed_weights = smooth_blend_values(smoothed_angles, angle_threshold)
                 
                 # 在float32格式下进行blend操作，避免精度损失
