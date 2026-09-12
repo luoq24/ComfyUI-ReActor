@@ -26,6 +26,7 @@ import folder_paths
 
 import scripts.reactor_version
 from r_chainner import model_loading
+from scripts.reactor_swapper import insightface_path
 from scripts.reactor_faceswap import (
     FaceSwapScript,
     get_models,
@@ -1269,6 +1270,17 @@ class RestoreFaceAdvanced:
         return (result,)
 
 
+# Process-wide insightface detector for mask_eyes. ComfyUI re-instantiates nodes
+# on every queue, so an instance-level cache would re-create the ORT sessions
+# each run (heavy VRAM alloc/dealloc churn — on a full GPU the session init can
+# fail with bad allocation and even take the process down).
+_FACE_AUTHORITY_CACHE = {}
+# Code-level constant (like _eye_debug): max faces detected per frame for the
+# box mask / eye holes. Raise it for group videos. ReActor's typical 1-face
+# workflow never needs more than the default.
+_MASK_MAX_FACES = 4
+
+
 class MaskHelper:
     def __init__(self):
         self.labels = "all"
@@ -1278,6 +1290,7 @@ class MaskHelper:
         self._sam_cache = {}
         self._bbox_cache = {}
         self._blur_cache = {}
+        self._eye_debug = False
 
     @classmethod
     def INPUT_TYPES(s):
@@ -1306,6 +1319,12 @@ class MaskHelper:
             },
             "optional": {
                 "mask_optional": ("MASK",),
+                "mask_eyes": ("BOOLEAN", {"default": False, "label_off": "no", "label_on": "yes"}),
+                "eye_size": ("FLOAT", {"default": 1.2, "min": 0.5, "max": 2.5, "step": 0.05}),
+                "eye_dilation": ("INT", {"default": 6, "min": 0, "max": 64, "step": 1}),
+                "eye_feather": ("INT", {"default": 12, "min": 0, "max": 64, "step": 1}),
+                "box_mask": ("BOOLEAN", {"default": False, "label_off": "no", "label_on": "yes"}),
+                "box_mask_pad": ("INT", {"default": 16, "min": 0, "max": 64, "step": 1}),
             }
         }
 
@@ -1314,16 +1333,300 @@ class MaskHelper:
     FUNCTION = "execute"
     CATEGORY = "🌌 ReActor"
 
-    def execute(self, image, swapped_image, bbox_model_name, bbox_threshold, bbox_dilation, bbox_crop_factor, bbox_drop_size, sam_model_name, sam_dilation, sam_threshold, bbox_expansion, mask_hint_threshold, mask_hint_use_negative, morphology_operation, morphology_distance, blur_radius, sigma_factor, mask_optional=None):
+    def _get_face_authority(self):
+        """InsightFace RetinaFace(+1k3d68) detector — the same quality bar ReActor
+        itself uses for swapping. Practically junk-free at its default threshold
+        (unlike BlazeFace), so no geometric anti-junk heuristics are needed.
+        Cached process-wide; falls back to CPU providers when the GPU is too full
+        for a new ORT CUDA session (bad allocation) instead of disabling."""
+        global _FACE_AUTHORITY_CACHE
+        if "app" in _FACE_AUTHORITY_CACHE:
+            return _FACE_AUTHORITY_CACHE["app"]
+        import insightface
+        # insightface_path/providers are module-level imports: ComfyUI's loader
+        # removes the custom-node dir from sys.path after import, so a runtime
+        # 'from scripts.reactor_swapper import ...' would fail
+        app = None
+        last_err = None
+        for provs in (providers, ["CPUExecutionProvider"]):
+            try:
+                candidate = insightface.app.FaceAnalysis(
+                    name="buffalo_l",
+                    # task name differs across insightface versions: 'landmark_3d_68' vs 'landmark_3d68'
+                    allowed_modules=["detection", "landmark_3d_68", "landmark_3d68"],
+                    providers=provs,
+                    root=insightface_path,
+                )
+                candidate.prepare(ctx_id=0, det_size=(640, 640))
+                app = candidate
+                break
+            except Exception as e:
+                last_err = e
+                logger.warning(f"mask_eyes: insightface init failed with providers={provs} ({e})")
+        if app is None:
+            logger.warning(f"mask_eyes: insightface detector unavailable ({last_err}), eye preservation disabled")
+            return None
+        _FACE_AUTHORITY_CACHE["app"] = app
+        return app
+
+    def _eye_entries_from_face(self, face):
+        """Convert an insightface Face into a hole-drawing entry. Eye rings come
+        from the 68-point landmarks (iBUG layout: 36-41 / 42-47 per eye); when
+        landmarks are unavailable a coarse ellipse pair is derived from the
+        5-point kps (never draw nothing — a missed eye is a black eye)."""
+        kps = getattr(face, "kps", None)
+        if kps is None:
+            return None
+        kps = np.asarray(kps, dtype=np.float32)
+        if kps.ndim != 2 or kps.shape[0] < 2 or not np.isfinite(kps).all():
+            return None
+        e0, e1 = kps[0], kps[1]
+        d = float(np.linalg.norm(e0 - e1))
+        if d < 4.0:
+            return None
+        lmk = getattr(face, "landmark_3d_68", None)
+        if lmk is None:
+            # older insightface versions name it without the extra underscore
+            lmk = getattr(face, "landmark_3d68", None)
+        if lmk is not None:
+            pts = np.asarray(lmk, dtype=np.float32)[:, :2]
+            if pts.shape[0] >= 48 and np.isfinite(pts).all():
+                return {
+                    "bbox_xyxy": np.asarray(face.bbox, dtype=np.float32),
+                    "landmarks_xy": pts,
+                    "rings": [np.arange(36, 42), np.arange(42, 48)],
+                    "score": float(getattr(face, "det_score", 0.0)),
+                    "eye_src": "lmk68",
+                }
+        a, b = 0.26 * d, 0.115 * d
+        th = np.linspace(0.0, 2.0 * np.pi, 16, endpoint=False, dtype=np.float32)
+        shape = np.stack([a * np.cos(th), b * np.sin(th)], axis=1).astype(np.float32)
+        lmks = np.concatenate([e0[None, :] + shape, e1[None, :] + shape], axis=0)
+        return {
+            "bbox_xyxy": np.asarray(face.bbox, dtype=np.float32),
+            "landmarks_xy": lmks,
+            "rings": [np.arange(0, 16), np.arange(16, 32)],
+            "score": float(getattr(face, "det_score", 0.0)),
+            "eye_src": "kps",
+        }
+
+    def _detect_eye_faces(self, frames, dbg=False):
+        """Per-frame authoritative face detection (RetinaFace) with eye-ring
+        geometry. One canonical detection per real face keeps the holes stable."""
+        app = self._get_face_authority()
+        if app is None:
+            return None
+        results = []
+        for i, frame in enumerate(frames):
+            bgr = np.ascontiguousarray(frame[:, :, ::-1])
+            try:
+                faces = app.get(bgr, max_num=_MASK_MAX_FACES)
+            except Exception as e:
+                logger.warning(f"mask_eyes: detection failed on frame {i}: {e}")
+                faces = []
+            entries = []
+            for f in sorted(faces, key=lambda f: -float(getattr(f, "det_score", 0.0)))[:_MASK_MAX_FACES]:
+                e = self._eye_entries_from_face(f)
+                if e is not None:
+                    entries.append(e)
+            results.append(entries)
+        self._temporal_smooth(results, dbg=dbg, src="auth")
+        if dbg:
+            for i, faces in enumerate(results):
+                if not faces:
+                    logger.status(f"mask_eyes[dbg] auth f{i}: 0 faces")
+                for f in faces:
+                    b = f["bbox_xyxy"]
+                    eyes = " ".join(
+                        f"({p.mean(axis=0)[0]:.0f},{p.mean(axis=0)[1]:.0f})r{np.linalg.norm(p.max(axis=0) - p.min(axis=0)) / 2:.0f}"
+                        for p in (f["landmarks_xy"][ring].astype(np.float32) for ring in f["rings"]))
+                    logger.status(
+                        f"mask_eyes[dbg] auth f{i}: src={f['eye_src']} score={f['score']:.2f} "
+                        f"box=({b[0]:.0f},{b[1]:.0f})-({b[2]:.0f},{b[3]:.0f}) eyes={eyes}")
+        return results
+
+    def _temporal_smooth(self, frames_faces, dbg=False, src="auth", alpha=0.5):
+        """Per-face EMA on the eye-ring centroid/radius. A single-frame landmark
+        glitch (a ring jumping to the mouth/cheek) is held at the previous position:
+        when the raw centroid jumps more than 0.3x face size from the track history,
+        the history value is kept (alpha=0) until the raw detection returns."""
+        tracks = []  # {"center": (x, y), "size": s, "rings": [(cx, cy, r), ...]}
+        for fi, faces in enumerate(frames_faces):
+            used = set()
+            assignments = []
+            for f in faces:
+                b = f["bbox_xyxy"]
+                c = np.array([(b[0] + b[2]) * 0.5, (b[1] + b[3]) * 0.5], dtype=np.float32)
+                size = max(float(b[2] - b[0]), float(b[3] - b[1]), 1.0)
+                best_t, best_d = None, None
+                for ti, t in enumerate(tracks):
+                    if ti in used:
+                        continue
+                    d = float(math.hypot(c[0] - t["center"][0], c[1] - t["center"][1]))
+                    if d <= 0.5 * max(size, t["size"]) and (best_d is None or d < best_d):
+                        best_t, best_d = ti, d
+                assignments.append((f, c, size, best_t))
+                if best_t is not None:
+                    used.add(best_t)
+            for f, c, size, ti in assignments:
+                raw = []
+                for ring in f["rings"]:
+                    pts = f["landmarks_xy"][ring].astype(np.float32)
+                    ctr = pts.mean(axis=0)
+                    rad = float(np.linalg.norm(pts.max(axis=0) - pts.min(axis=0))) * 0.5
+                    raw.append((float(ctr[0]), float(ctr[1]), rad))
+                if ti is None:
+                    track = {"center": (float(c[0]), float(c[1])), "size": size, "rings": raw}
+                    tracks.append(track)
+                else:
+                    track = tracks[ti]
+                    smoothed = []
+                    for ri, (r, p) in enumerate(zip(raw, track["rings"])):
+                        jump = math.hypot(r[0] - p[0], r[1] - p[1])
+                        w = alpha if jump <= 0.3 * size else 0.0
+                        if dbg and w == 0.0:
+                            logger.status(f"mask_eyes[dbg] {src} f{fi}: ring{ri} jump {jump:.0f}px > {0.3 * size:.0f}px, held at ({p[0]:.0f},{p[1]:.0f})r{p[2]:.0f}")
+                        smoothed.append((w * r[0] + (1 - w) * p[0],
+                                         w * r[1] + (1 - w) * p[1],
+                                         w * r[2] + (1 - w) * p[2]))
+                    track["rings"] = smoothed
+                    track["center"] = (float(c[0]), float(c[1]))
+                    track["size"] = size
+                # Write the smoothed geometry back into the landmarks
+                lmks = f["landmarks_xy"]
+                for ring, (scx, scy, srad) in zip(f["rings"], track["rings"]):
+                    pts = lmks[ring].astype(np.float32)
+                    ctr = pts.mean(axis=0)
+                    rad = float(np.linalg.norm(pts.max(axis=0) - pts.min(axis=0))) * 0.5
+                    if rad > 0:
+                        lmks[ring] = np.array([scx, scy], dtype=np.float32) + (pts - ctr) * (srad / rad)
+
+    @staticmethod
+    def _to_uint8_frames(t):
+        t = t[..., :3]
+        if t.ndim == 3:
+            t = t.unsqueeze(0)
+        return t.clamp(0, 1).mul(255.0).add(0.5).to(torch.uint8).cpu().numpy()
+
+    def _build_eye_mask(self, image, eye_size, eye_dilation, eye_feather=12):
+        """Punch eye holes into the swap mask. Faces come from the authoritative
+        RetinaFace detector (junk-free) with eye rings from its 68-point landmarks
+        (kps-ellipse fallback). Two-scale holes: a solid core over the eye opening
+        plus a wide soft outer ramp. Returns a (B, H, W) float tensor or None."""
+        dbg = self._eye_debug
+        img = image if image.ndim == 4 else image.unsqueeze(0)
+        B, H, W = img.shape[0], img.shape[1], img.shape[2]
+        faces_per_frame = self._detect_eye_faces(list(self._to_uint8_frames(img)), dbg=dbg)
+        if faces_per_frame is None:
+            return None
+        return self._eye_mask_from_faces(faces_per_frame, B, H, W, eye_size, eye_dilation, eye_feather, dbg=dbg)
+
+    def _eye_mask_from_faces(self, faces_per_frame, B, H, W, eye_size, eye_dilation, eye_feather=12, dbg=False):
+        """Draw the two-scale eye holes (solid core + feathered outer ramp) for the
+        given per-frame face entries. Returns a (B, H, W) float tensor."""
+        masks = []
+        failed_frames = []
+        for i in range(B):
+            core_m = np.zeros((H, W), dtype=np.float32)
+            outer_m = np.zeros((H, W), dtype=np.float32)
+            per_frame = faces_per_frame[i]
+            if not per_frame:
+                failed_frames.append(i)
+            for face in per_frame:
+                lmks = face["landmarks_xy"]
+                x1, y1, x2, y2 = face["bbox_xyxy"]
+                face_w = max(float(x2 - x1), 1.0)
+                ring_pts = [lmks[ring].astype(np.float32) for ring in face["rings"]]
+                centers = [p.mean(axis=0) for p in ring_pts]
+                if len(centers) == 2:
+                    d = float(np.linalg.norm(centers[0] - centers[1]))
+                    # Implausible eye pair (inter-ocular distance / vertical alignment)
+                    if not (0.08 * face_w <= d <= 0.75 * face_w) or abs(centers[0][1] - centers[1][1]) > 0.5 * d:
+                        if dbg:
+                            logger.status(f"mask_eyes[dbg] f{i}: implausible eye pair (d={d:.0f}px, face_w={face_w:.0f}px), face skipped")
+                        continue
+                for ri, (pts, center) in enumerate(zip(ring_pts, centers)):
+                    ring_diam = float(np.linalg.norm(pts.max(axis=0) - pts.min(axis=0)))
+                    # Skip degenerate rings (landmarks can collapse on hard poses)
+                    if not (0.04 * face_w <= ring_diam <= 0.65 * face_w):
+                        if dbg:
+                            logger.status(f"mask_eyes[dbg] f{i}: ring{ri} degenerate (diam={ring_diam:.0f}px, face_w={face_w:.0f}px), skipped")
+                        continue
+                    if not (x1 - 0.25 * face_w <= center[0] <= x2 + 0.25 * face_w and
+                            y1 - 0.25 * face_w <= center[1] <= y2 + 0.25 * face_w):
+                        if dbg:
+                            logger.status(f"mask_eyes[dbg] f{i}: ring{ri} outside face box (center=({center[0]:.0f},{center[1]:.0f})), skipped")
+                        continue
+                    # Two-scale hole: a SOLID core over the eye opening (guarantees
+                    # 100% original pixels there — full iris colour and sharp
+                    # catchlights) plus a soft outer ramp for the tone transition.
+                    # A single blurred polygon never saturates on small faces
+                    # (feather sigma > hole radius), leaving the eye half-swapped.
+                    rad = float(np.mean(np.linalg.norm(pts - center, axis=1)))
+                    margin = float(eye_dilation) * min(max(face_w / 256.0, 0.25), 3.0)
+                    core_pts = center + (pts - center) * float(eye_size)
+                    outer_pts = center + (pts - center) * (float(eye_size) + margin / max(rad, 1.0))
+                    cv2.fillPoly(core_m, [np.round(core_pts).astype(np.int32)], 1.0)
+                    cv2.fillPoly(outer_m, [np.round(outer_pts).astype(np.int32)], 1.0)
+            # Wide feather on the outer boundary only: the tone step between the
+            # original pixels (inside) and the per-frame regenerated swapped skin
+            # (outside) is what flickers at nose wings / cheeks — a wide static
+            # ramp makes it imperceptible. The core keeps the eye opening solid.
+            if eye_feather > 0:
+                outer_m = cv2.GaussianBlur(outer_m, (0, 0), sigmaX=float(eye_feather))
+                mx = float(outer_m.max())
+                if mx > 0:
+                    outer_m = outer_m / mx
+            m = np.maximum(core_m, outer_m)
+            masks.append(torch.from_numpy(m))
+        if failed_frames:
+            shown = str(failed_frames[:10]).rstrip(']')
+            suffix = ", ..." if len(failed_frames) > 10 else "]"
+            logger.status(f"mask_eyes: no eyes detected on frame(s) {shown}{suffix} out of {B} — those keep the fully swapped face")
+        else:
+            logger.status(f"mask_eyes: eye regions excluded from the swap mask in all {B} frames")
+        return torch.stack(masks)
+
+    def execute(self, image, swapped_image, bbox_model_name, bbox_threshold, bbox_dilation, bbox_crop_factor, bbox_drop_size, sam_model_name, sam_dilation, sam_threshold, bbox_expansion, mask_hint_threshold, mask_hint_use_negative, morphology_operation, morphology_distance, blur_radius, sigma_factor, mask_optional=None, mask_eyes=False, eye_size=1.2, eye_dilation=6, eye_feather=12, box_mask=False, box_mask_pad=16):
         device = model_management.get_torch_device()
+        # self._eye_debug: code-level constant (see __init__), not exposed in the UI
 
         # Оптимально перемещаем тензоры - один раз в начале
         image = image.to(device) if isinstance(image, torch.Tensor) and image.device != device else image
         swapped_image = swapped_image.to(device) if isinstance(swapped_image, torch.Tensor) and swapped_image.device != device else swapped_image
 
+        combined_mask = None
+        faces_for_mask = None
         if mask_optional is not None:
             combined_mask = mask_optional
-        else:
+        elif box_mask:
+            # Box mask: per-frame rectangles from the authoritative detector — the
+            # same detection family GFPGAN's restore crop is derived from, so the
+            # composite boundary lands OUTSIDE the altered region (where the
+            # swapped frame equals the original) and its per-frame wobble is
+            # invisible. Scales with the face size, unlike a fixed dilation of
+            # the SAM silhouette.
+            H, W = int(image.shape[1]), int(image.shape[2])
+            faces_for_mask = self._detect_eye_faces(list(self._to_uint8_frames(image)), dbg=self._eye_debug)
+            if faces_for_mask is not None:
+                cm_list = []
+                pad = float(box_mask_pad)
+                for faces in faces_for_mask:
+                    m = torch.zeros((H, W), dtype=torch.float32, device=image.device)
+                    for f in faces:
+                        x1, y1, x2, y2 = f["bbox_xyxy"]
+                        xa = max(int(round(float(x1) - pad)), 0)
+                        ya = max(int(round(float(y1) - pad)), 0)
+                        xb = min(int(round(float(x2) + pad)) + 1, W)
+                        yb = min(int(round(float(y2) + pad)) + 1, H)
+                        if xb > xa and yb > ya:
+                            m[ya:yb, xa:xb] = 1.0
+                    cm_list.append(m)
+                combined_mask = torch.stack(cm_list)
+                n_empty = sum(1 for m in cm_list if float(m.max()) == 0.0)
+                if n_empty:
+                    logger.warning(f"box_mask: no face detected on {n_empty}/{len(cm_list)} frames — those keep the original image")
+        if combined_mask is None:
             # Load and cache BBox model
             if bbox_model_name not in self._bbox_cache:
                 bbox_model_path = folder_paths.get_full_path("ultralytics", bbox_model_name)
@@ -1388,6 +1691,20 @@ class MaskHelper:
         elif morphology_operation == "close":
             combined_mask = self.iterative_morphology(self.iterative_morphology(combined_mask, morphology_distance, op="dilate"), morphology_distance, op="erode")
 
+        # Preserve original eyes: exclude eye regions from the swap mask (authoritative RetinaFace detection)
+        if mask_eyes:
+            if faces_for_mask is not None:
+                # box_mask mode: reuse the detection already done for the box mask
+                eye_mask = self._eye_mask_from_faces(faces_for_mask, int(image.shape[0]), int(image.shape[1]), int(image.shape[2]), eye_size, eye_dilation, eye_feather, dbg=self._eye_debug)
+            else:
+                eye_mask = self._build_eye_mask(image, eye_size, eye_dilation, eye_feather)
+            if eye_mask is not None:
+                eye_mask = eye_mask.to(device=combined_mask.device, dtype=combined_mask.dtype)
+                if eye_mask.shape[0] == combined_mask.shape[0]:
+                    combined_mask = combined_mask * (1.0 - eye_mask)
+                else:
+                    logger.warning(f"mask_eyes: batch mismatch (mask {combined_mask.shape[0]} vs eyes {eye_mask.shape[0]}), skipped")
+
         # Gaussian blur
         if blur_radius > 0:
             blur_key = f"{blur_radius}_{sigma_factor}"
@@ -1400,10 +1717,45 @@ class MaskHelper:
 
         # Apply mask to swapped image (basic RGBA composite)
         swapped_image = swapped_image.to(device) if swapped_image.device != device else swapped_image
-        swapped_rgba = core.tensor2rgba(swapped_image)
 
         mask_image_final = mask_blurred
-        
+
+        # *** FAST PATH: aligned batch (standard video use-case) ***
+        # swapped_image is the same frames with the face swapped, perfectly aligned
+        # to the original — composite directly. The generic cut/resize/paste path
+        # below rescales EVERY face to the largest bbox in the batch, distorting
+        # smaller faces and making the result flicker frame-to-frame.
+        #
+        # Composite chunk-by-chunk: a 243-frame 720p batch converted to RGBA in one
+        # go needs ~4 GB per tensor (several of them simultaneously) and OOMs.
+        if swapped_image.shape[0] == image.shape[0] and tuple(swapped_image.shape[1:3]) == tuple(image.shape[1:3]):
+            mask0 = core.tensor2mask(mask_image_final)
+            H0, W0 = int(image.shape[1]), int(image.shape[2])
+            mask0 = torch.nn.functional.interpolate(mask0.unsqueeze(1), size=(H0, W0), mode='nearest')[:, 0, :, :]
+            MB0 = mask0.shape[0]
+            if MB0 < image.shape[0]:
+                mask0 = mask0.repeat(image.shape[0] // MB0, 1, 1)
+            C0 = int(image.shape[3])
+            results = []
+            segments = []
+            chunk = 32
+            for i in range(0, int(image.shape[0]), chunk):
+                img_c = core.tensor2rgba(image[i:i + chunk])
+                swp_c = core.tensor2rgba(swapped_image[i:i + chunk])
+                mk_c = mask0[i:i + chunk].unsqueeze(-1)
+                comp = torch.lerp(img_c, swp_c, mk_c)
+                del img_c, swp_c
+                seg = comp.clone()
+                seg[..., 3] = mask0[i:i + chunk]
+                rgb = core.tensor2rgb(comp) if C0 == 3 else comp
+                results.append(rgb.cpu())
+                segments.append(seg.cpu())
+                del comp, seg, rgb
+            result = torch.cat(results, dim=0)
+            face_segment = torch.cat(segments, dim=0)
+            return (result, combined_mask, mask_blurred, face_segment)
+        # *** generic path below for non-aligned inputs ***
+
         # *** CUT BY MASK ***:
     
         if len(swapped_image.shape) < 4:
@@ -1564,14 +1916,16 @@ class MaskHelper:
 
                 result[image_index] = pasting * paste_mask + result[image_index] * (1. - paste_mask)
 
-                face_segment = result
-
-                face_segment[...,3] = mask[i]
-
-                result = rgba2rgb_tensor(result)
-                result = result.cpu()  # Перемещаем результат обратно на CPU
-
                 pbar.update(1)
+
+        # Per-frame alpha preview + RGBA→RGB conversion must happen AFTER the loop:
+        # converting inside the loop breaks the next iteration (result becomes 3ch
+        # while paste_mask stays 4ch) — this is why batch inputs used to crash here
+        face_segment = result
+        face_segment[..., 3] = mask
+
+        result = rgba2rgb_tensor(result)
+        result = result.cpu()  # Перемещаем результат обратно на CPU
 
         try:
             torch.cuda.empty_cache()
