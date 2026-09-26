@@ -1634,11 +1634,20 @@ class MaskHelper:
                 self._bbox_cache[bbox_model_name] = subcore.UltraBBoxDetector(model)
             bbox_detector = self._bbox_cache[bbox_model_name]
 
-            segs_all, seg_labels = bbox_detector.detect(image, bbox_threshold, bbox_dilation, bbox_crop_factor, bbox_drop_size, self.detailer_hook)
-
-            if self.labels != 'all':
-                labels = self.labels.split(',') if isinstance(self.labels, str) else self.labels
-                segs_all, _ = masking_segs.filter(segs_all, labels)
+            # tensor_to_pil 仅取 batch[0]：整批一起检测会让所有帧共用第 0 帧的人脸框，
+            # 人脸一旦移动 mask 即错位（换脸结果被合成回原图）——必须逐帧检测。
+            frame_count = image.shape[0] if image.ndim == 4 else 1
+            segs_per_frame = []
+            for i in range(frame_count):
+                image_i = image[i:i+1] if image.ndim == 4 else image
+                segs_frame = bbox_detector.detect(
+                    image_i, bbox_threshold, bbox_dilation,
+                    bbox_crop_factor, bbox_drop_size, self.detailer_hook
+                )
+                if self.labels != 'all':
+                    labels = self.labels.split(',') if isinstance(self.labels, str) else self.labels
+                    segs_frame, _ = masking_segs.filter(segs_frame, labels)
+                segs_per_frame.append(segs_frame)
 
             # Load and cache SAM model
             if sam_model_name not in self._sam_cache:
@@ -1658,15 +1667,13 @@ class MaskHelper:
             else:
                 sam = self._sam_cache[sam_model_name]
 
-            # Handle batched input
+            # Handle batched input（segs_per_frame[i] 为 (shape, items)，make_sam_mask_segmented 内部取 segs[1]）
             if image.ndim == 4:
                 combined_masks = []
                 for i in range(image.shape[0]):
-                    segs_i = segs_all[i] if i < len(segs_all) else []
-                    segs_tuple = ([segs_i], seg_labels) if isinstance(segs_i, dict) else (segs_i, seg_labels)
                     image_i = image[i]
                     mask_i, _ = core.make_sam_mask_segmented(
-                        sam, segs_tuple, image_i, self.detection_hint,
+                        sam, segs_per_frame[i], image_i, self.detection_hint,
                         sam_dilation, sam_threshold, bbox_expansion,
                         mask_hint_threshold, mask_hint_use_negative
                     )
@@ -1674,7 +1681,7 @@ class MaskHelper:
                 combined_mask = torch.stack(combined_masks)
             else:
                 combined_mask, _ = core.make_sam_mask_segmented(
-                    sam, (segs_all, seg_labels), image, self.detection_hint,
+                    sam, segs_per_frame[0], image, self.detection_hint,
                     sam_dilation, sam_threshold, bbox_expansion,
                     mask_hint_threshold, mask_hint_use_negative
                 )

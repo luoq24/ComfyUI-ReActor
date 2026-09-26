@@ -63,6 +63,14 @@ class UltraBBoxDetector:
 
     def detect(self, image, threshold, dilation, crop_factor, drop_size=1, detailer_hook=None):
         drop_size = max(drop_size, 1)
+        # tensor_to_pil 默认只取 batch[0]：整批输入会让所有检测框都来自第 0 帧，
+        # mask 与实际帧错位（换脸结果被合成回原图）——批量输入必须由调用方逐帧拆分后调用。
+        if image.ndim == 4 and image.shape[0] > 1:
+            raise ValueError(
+                f"UltraBBoxDetector.detect got a batched image ({int(image.shape[0])} frames). "
+                "tensor_to_pil only converts batch[0], which would silently reuse frame 0's "
+                "detection for every frame — split the batch and call detect per frame."
+            )
         detected_results = inference_bbox(self.bbox_model, tensor_to_pil(image), threshold)
         segmasks = core.create_segmasks(detected_results)
 
