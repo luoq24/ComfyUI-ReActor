@@ -1591,9 +1591,13 @@ class MaskHelper:
         device = model_management.get_torch_device()
         # self._eye_debug: code-level constant (see __init__), not exposed in the UI
 
-        # Оптимально перемещаем тензоры - один раз в начале
-        image = image.to(device) if isinstance(image, torch.Tensor) and image.device != device else image
-        swapped_image = swapped_image.to(device) if isinstance(swapped_image, torch.Tensor) and swapped_image.device != device else swapped_image
+        # ВАЖНО: не перемещаем image/swapped_image на GPU целиком. Для видео (сотни
+        # кадров) полный fp32-батч занимает гигабайты VRAM; под таким давлением
+        # драйвер падает с "Windows fatal exception: access violation" при первом
+        # же крупном копировании D2H. Батчи остаются на CPU — на GPU попадают только
+        # погранные срезы при композитинге (fast path ниже) или весь батч в generic
+        # path (там это было и раньше). Детекция спокойно работает с CPU-срезами:
+        # tensor_to_pil / make_sam_mask_segmented делают .cpu() сами.
 
         combined_mask = None
         faces_for_mask = None
@@ -1686,6 +1690,11 @@ class MaskHelper:
                     mask_hint_threshold, mask_hint_use_negative
                 )
 
+        # Маски обрабатываем на compute device (как раньше, когда SAM возвращал
+        # маски уже на GPU): morph/eye/blur покадровые и не зависят от устройства.
+        if isinstance(combined_mask, torch.Tensor) and combined_mask.device != device:
+            combined_mask = combined_mask.to(device)
+
         # Morph operations
         if morphology_operation == "dilate":
             # print(f"max before: {combined_mask.max()}, min: {combined_mask.min()}, sum: {combined_mask.sum()}")
@@ -1723,7 +1732,8 @@ class MaskHelper:
             mask_blurred = combined_mask
 
         # Apply mask to swapped image (basic RGBA composite)
-        swapped_image = swapped_image.to(device) if swapped_image.device != device else swapped_image
+        # NOTE: swapped_image остаётся на CPU — fast path композитит погранно,
+        # generic path ниже сам переносит нужные тензоры на GPU.
 
         mask_image_final = mask_blurred
 
@@ -1742,26 +1752,62 @@ class MaskHelper:
             MB0 = mask0.shape[0]
             if MB0 < image.shape[0]:
                 mask0 = mask0.repeat(image.shape[0] // MB0, 1, 1)
+            # Полные маски переносим на CPU: во время композитинга на GPU держится
+            # только текущий чанк (~1-2 GB), иначе длинное видео исчерпывает VRAM.
+            if mask0.device.type != 'cpu':
+                mask0 = mask0.cpu()
+            if combined_mask.device.type != 'cpu':
+                combined_mask = combined_mask.cpu()
+            if mask_blurred.device.type != 'cpu':
+                mask_blurred = mask_blurred.cpu()
+            mask_image_final = mask_blurred  # отпускаем GPU-копию маски
             C0 = int(image.shape[3])
+
+            def _composite_chunk(sl, use_gpu):
+                img_c = core.tensor2rgba(image[sl])
+                swp_c = core.tensor2rgba(swapped_image[sl])
+                mk_c = mask0[sl].unsqueeze(-1)
+                if use_gpu:
+                    img_c = img_c.to(device)
+                    swp_c = swp_c.to(device)
+                    mk_c = mk_c.to(device)
+                comp = torch.lerp(img_c, swp_c, mk_c)
+                del img_c, swp_c
+                seg = comp.clone()
+                seg[..., 3] = mk_c.squeeze(-1)
+                rgb = core.tensor2rgb(comp) if C0 == 3 else comp
+                del comp
+                return rgb.cpu(), seg.cpu()
+
             results = []
             segments = []
             chunk = 32
             for i in range(0, int(image.shape[0]), chunk):
-                img_c = core.tensor2rgba(image[i:i + chunk])
-                swp_c = core.tensor2rgba(swapped_image[i:i + chunk])
-                mk_c = mask0[i:i + chunk].unsqueeze(-1)
-                comp = torch.lerp(img_c, swp_c, mk_c)
-                del img_c, swp_c
-                seg = comp.clone()
-                seg[..., 3] = mask0[i:i + chunk]
-                rgb = core.tensor2rgb(comp) if C0 == 3 else comp
-                results.append(rgb.cpu())
-                segments.append(seg.cpu())
-                del comp, seg, rgb
+                sl = slice(i, min(i + chunk, int(image.shape[0])))
+                try:
+                    rgb, seg = _composite_chunk(sl, use_gpu=True)
+                except RuntimeError as e:
+                    logger.warning(f"GPU composite failed on chunk {i} ({e}); retrying on CPU")
+                    try:
+                        torch.cuda.empty_cache()
+                    except Exception:
+                        pass
+                    rgb, seg = _composite_chunk(sl, use_gpu=False)
+                results.append(rgb)
+                segments.append(seg)
+                del rgb, seg
             result = torch.cat(results, dim=0)
             face_segment = torch.cat(segments, dim=0)
             return (result, combined_mask, mask_blurred, face_segment)
         # *** generic path below for non-aligned inputs ***
+
+        # Generic path перемешивает image/swapped/mask в общих операциях и ожидает
+        # их на compute device — переносим полный батч (как раньше, до погранного
+        # fast path). Сюда попадают только несовпадающие по размеру входы.
+        image = image.to(device) if image.device != device else image
+        swapped_image = swapped_image.to(device) if swapped_image.device != device else swapped_image
+        if mask_image_final.device != device:
+            mask_image_final = mask_image_final.to(device)
 
         # *** CUT BY MASK ***:
     
