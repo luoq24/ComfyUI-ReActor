@@ -287,7 +287,22 @@ class reactor:
                 restored_faces = []
                 
                 # берем сохранённые bbox из swap (или None)
-                swapped_bboxes = getattr(self, "last_swapped_bboxes", None)
+                # swap 阶段现按帧记录 bbox（每帧一个列表），此处只与当前帧
+                # 实际换过脸的 bbox 匹配；未换脸的帧不再被相邻帧的 bbox
+                # 误匹配而做 GFPGAN 修复（修复纹理突变也是闪烁来源之一）
+                swapped_all = getattr(self, "last_swapped_bboxes", None)
+                swapped_bboxes = None
+                if swapped_all:
+                    if len(swapped_all) == total_images and isinstance(swapped_all[0], (list, tuple)):
+                        frame_boxes = swapped_all[i] if i < len(swapped_all) else []
+                        if frame_boxes and isinstance(frame_boxes[0], (int, float)):
+                            # 兼容旧版扁平结构（元素是坐标而非 bbox 列表）
+                            swapped_bboxes = swapped_all
+                        else:
+                            swapped_bboxes = frame_boxes
+                    else:
+                        # 兼容旧版扁平结构
+                        swapped_bboxes = swapped_all
                 # флаги, чтобы одно сохранённое bbox не совпало с несколькими лицами
                 used_swapped = [False] * len(swapped_bboxes) if swapped_bboxes else None
 
@@ -490,8 +505,16 @@ class reactor:
             result = batched_pil_to_tensor(p.init_images)
             # print(f"bbox={p.bbox}")
             if len(p.bbox) > 0:
-                self.last_swapped_bboxes = p.bbox
+                # 统一为"每帧一组bbox"的结构，供 restore_face 按帧精确匹配；
+                # 扁平结构（单图路径）包装成单帧
+                first = p.bbox[0]
+                if isinstance(first, (tuple, list)) and len(first) == 4 and all(isinstance(v, (int, float)) for v in first):
+                    self.last_swapped_bboxes = [p.bbox]
+                else:
+                    self.last_swapped_bboxes = p.bbox
                 # self.last_swapped_indices = p.swapped_indexes
+            else:
+                self.last_swapped_bboxes = None
             original_image = input_image
 
             if face_model is None:
@@ -508,7 +531,12 @@ class reactor:
                 logger.status("Applying smooth blend based on face angles...")
                 # 对角度序列进行平滑处理，减少检测抖动
                 smoothed_angles = p.face_angles
-                smoothed_weights = smooth_blend_values(smoothed_angles, angle_threshold)
+                # 优先使用 swap 阶段预计算的 blend 权重（与软跳过逻辑完全一致）
+                pre_weights = getattr(p, 'face_blend_weights', None)
+                if pre_weights is not None and len(pre_weights) == len(smoothed_angles):
+                    smoothed_weights = pre_weights
+                else:
+                    smoothed_weights = smooth_blend_values(smoothed_angles, angle_threshold)
                 
                 # 在float32格式下进行blend操作，避免精度损失
                 result_np = result.cpu().numpy().astype(np.float32)
@@ -1357,7 +1385,9 @@ class MaskHelper:
                     providers=provs,
                     root=insightface_path,
                 )
-                candidate.prepare(ctx_id=0, det_size=(640, 640))
+                # 略降检测阈值（与换脸路径的 VIDEO_DET_THRESH 一致）：
+                # 运动模糊帧漏检 = mask 掉空 = 合成回原脸 = 闪烁
+                candidate.prepare(ctx_id=0, det_size=(640, 640), det_thresh=0.4)
                 app = candidate
                 break
             except Exception as e:
@@ -1431,6 +1461,7 @@ class MaskHelper:
                     entries.append(e)
             results.append(entries)
         self._temporal_smooth(results, dbg=dbg, src="auth")
+        self._coast_missing_faces(results, dbg=dbg)
         if dbg:
             for i, faces in enumerate(results):
                 if not faces:
@@ -1500,6 +1531,45 @@ class MaskHelper:
                     rad = float(np.linalg.norm(pts.max(axis=0) - pts.min(axis=0))) * 0.5
                     if rad > 0:
                         lmks[ring] = np.array([scx, scy], dtype=np.float32) + (pts - ctr) * (srad / rad)
+
+    def _coast_missing_faces(self, frames_faces, coast_limit=10, dbg=False):
+        """短暂漏检桥接（coast）。手遮挡后大幅运动/快速转头时，逐帧检测会
+        间歇性漏掉主脸：漏检帧没有 face 条目 → 该帧 mask/眼洞缺失 →
+        合成结果整帧回退为原图，表现为"换脸/原脸"快速交替闪烁。
+        这里按时序把人脸锁定到轨迹上，漏检帧沿用该轨迹最近一次的
+        bbox+眼环数据（最多 coast_limit 帧），让 mask 保持稳定。"""
+        tracks = []  # {"entry": 最近条目, "center": (x, y), "size": s, "miss": 连续丢失帧数}
+        for fi, faces in enumerate(frames_faces):
+            used = set()
+            for f in faces:
+                b = f["bbox_xyxy"]
+                c = np.array([(b[0] + b[2]) * 0.5, (b[1] + b[3]) * 0.5], dtype=np.float32)
+                size = max(float(b[2] - b[0]), float(b[3] - b[1]), 1.0)
+                best_t, best_d = None, None
+                for ti, t in enumerate(tracks):
+                    if ti in used:
+                        continue
+                    d = float(math.hypot(c[0] - t["center"][0], c[1] - t["center"][1]))
+                    if d <= 0.6 * max(size, t["size"]) and (best_d is None or d < best_d):
+                        best_t, best_d = ti, d
+                if best_t is not None:
+                    used.add(best_t)
+                    t = tracks[best_t]
+                    t["entry"] = f
+                    t["center"] = (float(c[0]), float(c[1]))
+                    t["size"] = size
+                    t["miss"] = 0
+                else:
+                    tracks.append({"entry": f, "center": (float(c[0]), float(c[1])), "size": size, "miss": 0})
+                    used.add(len(tracks) - 1)
+            for ti, t in enumerate(tracks):
+                if ti in used:
+                    continue
+                t["miss"] += 1
+                if t["miss"] <= coast_limit:
+                    # 沿用最近一次检测到的框/眼环（浅拷贝即可，下游只读）
+                    faces.append(dict(t["entry"]))
+        return frames_faces
 
     @staticmethod
     def _to_uint8_frames(t):
@@ -1653,6 +1723,51 @@ class MaskHelper:
                     segs_frame, _ = masking_segs.filter(segs_frame, labels)
                 segs_per_frame.append(segs_frame)
 
+            # 轨迹感知的漏检桥接（coast）：不能只看 segs 是否为空——场景里有
+            # 背景人脸时，主脸漏检的帧 segs 仍非空（只剩背景脸），SAM 只会
+            # 盖住背景脸，主脸区域 mask=0 → 整帧回退原图（换脸/原脸交替闪烁）。
+            # 这里把逐帧 segs 按轨迹匹配，主脸（任一已跟踪轨迹）缺失的帧
+            # 注入该轨迹最近一次的 Seg（最多 10 帧），保持 mask 连续。
+            _COAST_LIMIT = 10
+            _tracks = []  # {"seg": Seg, "center": (x, y), "size": s, "miss": 连续丢失帧数}
+            for i in range(frame_count):
+                segs = segs_per_frame[i]
+                if isinstance(segs, (tuple, list)) and len(segs) >= 2:
+                    _shape, _items = segs[0], list(segs[1])
+                else:
+                    _shape, _items = None, list(segs) if segs is not None else []
+                used = set()
+                for it in _items:
+                    try:
+                        b = np.asarray(it.bbox, dtype=np.float64)
+                    except Exception:
+                        continue
+                    c = ((b[0] + b[2]) * 0.5, (b[1] + b[3]) * 0.5)
+                    size = max(float(b[2] - b[0]), float(b[3] - b[1]), 1.0)
+                    best_t, best_d = None, None
+                    for ti, t in enumerate(_tracks):
+                        if ti in used:
+                            continue
+                        d = math.hypot(c[0] - t["center"][0], c[1] - t["center"][1])
+                        if d <= 0.6 * max(size, t["size"]) and (best_d is None or d < best_d):
+                            best_t, best_d = ti, d
+                    if best_t is not None:
+                        used.add(best_t)
+                        t = _tracks[best_t]
+                        t["seg"], t["center"], t["size"], t["miss"] = it, c, size, 0
+                    else:
+                        _tracks.append({"seg": it, "center": c, "size": size, "miss": 0})
+                        used.add(len(_tracks) - 1)
+                injected = []
+                for ti, t in enumerate(_tracks):
+                    if ti in used:
+                        continue
+                    t["miss"] += 1
+                    if t["miss"] <= _COAST_LIMIT:
+                        injected.append(t["seg"])
+                if injected:
+                    segs_per_frame[i] = (_shape, _items + injected)
+
             # Load and cache SAM model
             if sam_model_name not in self._sam_cache:
                 sam_model_path = folder_paths.get_full_path("sams", sam_model_name)
@@ -1761,6 +1876,46 @@ class MaskHelper:
             if mask_blurred.device.type != 'cpu':
                 mask_blurred = mask_blurred.cpu()
             mask_image_final = mask_blurred  # отпускаем GPU-копию маски
+
+            # —— mask 失效保底（终极防线）——
+            # 换脸真正发生时 |swapped - original| 在脸区域必然显著非零，且差异区
+            # 之外两图逐像素相同。逐帧检查 mask 是否真的把换好的脸"显示"出来了：
+            # 若 mask 在差异区域的覆盖率过低（任何检测类失效：漏检/SAM 空掩码/
+            # 阈值过严/轨迹过期），沿用上一个正常帧的 mask（最多 10 帧）。
+            # 正常帧完全不受影响；眼洞（瞳孔保持）随 mask 一起沿用。
+            try:
+                if mask_optional is None:
+                    _CH = 8
+                    _cores = []
+                    for s in range(0, image.shape[0], _CH):
+                        e = min(s + _CH, image.shape[0])
+                        d = (swapped_image[s:e].to(device, torch.float32) - image[s:e].to(device, torch.float32)).abs().mean(dim=-1)
+                        _cores.append((d > 0.08).cpu())
+                    _core = torch.cat(_cores, dim=0) if _cores else None  # (B,H,W) bool
+                    if _core is not None:
+                        _total = _core.sum(dim=(1, 2)).float()
+                        _cover = (mask0 * _core.float()).sum(dim=(1, 2))
+                        _area_gate = 0.001 * float(mask0.shape[1] * mask0.shape[2])
+                        _bad = (_total > _area_gate) & ((_cover / _total.clamp(min=1.0)) < 0.5)
+                        _fixed = []
+                        _last_good = None
+                        _last_good_i = None
+                        _COAST = 10
+                        for i in range(mask0.shape[0]):
+                            if bool(_bad[i]):
+                                if _last_good is not None and (i - _last_good_i) <= _COAST:
+                                    mask0[i] = _last_good
+                                    _fixed.append(i)
+                            else:
+                                _last_good = mask0[i].clone()
+                                _last_good_i = i
+                        if _fixed:
+                            logger.status(
+                                f"mask: the swapped face was hidden by the mask on {len(_fixed)} frame(s) "
+                                f"— restored from the last good frame's mask")
+            except Exception as _e:
+                logger.warning(f"mask: swapped-face visibility fallback skipped ({_e})")
+
             C0 = int(image.shape[3])
 
             def _composite_chunk(sl, use_gpu):

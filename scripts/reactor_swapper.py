@@ -78,6 +78,9 @@ TARGET_IMAGE_HASH = None
 TARGET_FACES_LIST = []
 TARGET_IMAGE_LIST_HASH = []
 
+# 视频逐帧处理时略微降低检测阈值：减少运动模糊/侧脸帧的漏检（漏检帧 = 原脸闪回，是闪烁来源之一）
+VIDEO_DET_THRESH = 0.4
+
 def unload_model(model):
     if model is not None:
         # check if model has unload method
@@ -98,14 +101,14 @@ def get_current_faces_model():
     global SOURCE_FACES
     return SOURCE_FACES
 
-def getAnalysisModel(det_size = (640, 640)):
+def getAnalysisModel(det_size = (640, 640), det_thresh = 0.5):
     global ANALYSIS_MODELS
     ANALYSIS_MODEL = ANALYSIS_MODELS[str(det_size[0])]
     if ANALYSIS_MODEL is None:
         ANALYSIS_MODEL = insightface.app.FaceAnalysis(
             name="buffalo_l", providers=providers, root=insightface_path
         )
-    ANALYSIS_MODEL.prepare(ctx_id=0, det_size=det_size)
+    ANALYSIS_MODEL.prepare(ctx_id=0, det_size=det_size, det_thresh=det_thresh)
     ANALYSIS_MODELS[str(det_size[0])] = ANALYSIS_MODEL
     return ANALYSIS_MODEL
 
@@ -356,8 +359,8 @@ def half_det_size(det_size):
     logger.status("Trying to halve 'det_size' parameter")
     return (det_size[0] // 2, det_size[1] // 2)
 
-def analyze_faces(img_data: np.ndarray, det_size=(640, 640)):
-    face_analyser = getAnalysisModel(det_size)
+def analyze_faces(img_data: np.ndarray, det_size=(640, 640), det_thresh: float = 0.5):
+    face_analyser = getAnalysisModel(det_size, det_thresh)
 
     faces = []
     try:
@@ -368,7 +371,7 @@ def analyze_faces(img_data: np.ndarray, det_size=(640, 640)):
     # Try halving det_size if no faces are found
     if len(faces) == 0 and det_size[0] > 320 and det_size[1] > 320:
         det_size_half = half_det_size(det_size)
-        return analyze_faces(img_data, det_size_half)
+        return analyze_faces(img_data, det_size_half, det_thresh)
 
     return faces
 
@@ -402,43 +405,201 @@ def get_face_single(img_data: np.ndarray, face, face_index=0, det_size=(640, 640
         return None, 0, None
 
 
+def _bbox_iou(a, b) -> float:
+    """计算两个 bbox [x1,y1,x2,y2] 的 IoU"""
+    xx1 = max(a[0], b[0])
+    yy1 = max(a[1], b[1])
+    xx2 = min(a[2], b[2])
+    yy2 = min(a[3], b[3])
+    iw = max(0.0, xx2 - xx1)
+    ih = max(0.0, yy2 - yy1)
+    inter = iw * ih
+    area_a = max(0.0, a[2] - a[0]) * max(0.0, a[3] - a[1])
+    area_b = max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
+    union = area_a + area_b - inter
+    return inter / union if union > 0 else 0.0
+
+
+def _get_face_embedding(face):
+    """获取人脸嵌入向量（优先归一化嵌入），用于外观相似度匹配"""
+    emb = getattr(face, "normed_embedding", None)
+    if emb is None:
+        emb = getattr(face, "embedding", None)
+        if emb is not None:
+            norm = float(np.linalg.norm(emb))
+            emb = emb / norm if norm > 1e-6 else None
+    return emb
+
+
+def track_face_across_frames(frames_faces, order, slot=0, taken=None):
+    """
+    时序人脸跟踪：在视频帧序列中为第 slot 号人脸槽位锁定同一个人。
+
+    背景：逐帧独立按 faces_order 选脸时，主角转头（框变小）或运动模糊
+    会导致下一帧跳选到背景中的人脸，或漏检导致原脸闪回，造成输出闪烁。
+
+    策略：
+      - 第一张有效帧按 order 排序取第 slot 个作为跟踪起点；
+      - 后续帧在候选中按 IoU + 中心距离 + 面积相似度 + 嵌入相似度
+        综合打分，选择与上一帧锁定人脸最匹配的；
+      - 空间上完全不符（无重叠、距离过远、外观也不像）的候选直接排除，
+        宁可该帧不换脸也不换错人；
+      - 连续多帧丢失后重置跟踪，允许重新按 order 选脸。
+
+    Args:
+        frames_faces: list，每帧一个 face 列表
+        order: faces_order 排序策略
+        slot: 槽位号（在首帧排序中的名次）
+        taken: 可选，list（每帧一个 set，存 id(face)），已被其他槽位占用的人脸
+
+    Returns:
+        list: 每帧对应的人脸（未匹配到时为 None）
+    """
+    n_frames = len(frames_faces)
+    selected = [None] * n_frames
+    prev_bbox = None
+    prev_area = 0.0
+    prev_emb = None
+    miss_count = 0
+    RESET_AFTER_MISSES = 15  # 连续丢失约半秒（30fps）后重置跟踪
+
+    for i in range(n_frames):
+        faces_all = list(frames_faces[i] or [])
+        if len(faces_all) == 0:
+            miss_count += 1
+            if prev_bbox is not None and miss_count > RESET_AFTER_MISSES:
+                prev_bbox = None
+                prev_emb = None
+            continue
+
+        # 排序一次：初始选择用原始名次（保证多槽位各取各的脸），
+        # 匹配阶段剔除已被其他槽位占用的人脸
+        # 注：taken 存 id(face)——insightface Face 定义了 __eq__ 但不可哈希
+        ordered = sort_by_order(faces_all, order)
+        if taken is not None:
+            taken_ids = taken[i]
+            candidates = [f for f in ordered if id(f) not in taken_ids]
+        else:
+            candidates = ordered
+
+        if prev_bbox is None:
+            if slot < len(ordered):
+                f = ordered[slot]
+                if taken is None or id(f) not in taken[i]:
+                    selected[i] = f
+                    bbox = np.asarray(f.bbox, dtype=np.float64)
+                    prev_bbox = bbox
+                    prev_area = max(1e-6, (bbox[2] - bbox[0]) * (bbox[3] - bbox[1]))
+                    prev_emb = _get_face_embedding(f)
+                    miss_count = 0
+            continue
+
+        if len(candidates) == 0:
+            miss_count += 1
+            continue
+
+        diag = max(np.hypot(prev_bbox[2] - prev_bbox[0], prev_bbox[3] - prev_bbox[1]), 1e-6)
+        pc = np.array([(prev_bbox[0] + prev_bbox[2]) / 2.0, (prev_bbox[1] + prev_bbox[3]) / 2.0])
+
+        best_f = None
+        best_score = 0.0
+        for f in candidates:
+            bbox = np.asarray(f.bbox, dtype=np.float64)
+            iou = _bbox_iou(prev_bbox, bbox)
+            cc = np.array([(bbox[0] + bbox[2]) / 2.0, (bbox[1] + bbox[3]) / 2.0])
+            dist = float(np.linalg.norm(cc - pc))
+            dist_score = max(0.0, 1.0 - dist / (diag * 2.0))
+            area = max(1e-6, (bbox[2] - bbox[0]) * (bbox[3] - bbox[1]))
+            size_score = max(0.0, 1.0 - abs(np.log(area / prev_area)))
+            emb_sim = 0.0
+            emb = _get_face_embedding(f)
+            if prev_emb is not None and emb is not None:
+                emb_sim = max(0.0, float(np.dot(prev_emb, emb)))
+            # 空间/外观合理性门槛：与上一帧位置完全不符且外观也不像时直接排除
+            if iou <= 0.01 and dist > diag * 2.5 and (prev_emb is None or emb_sim < 0.3):
+                continue
+            score = 1.5 * iou + 1.0 * dist_score + 0.5 * size_score + 0.8 * emb_sim
+            if score > best_score:
+                best_score = score
+                best_f = f
+
+        if best_f is not None and best_score >= 0.8:
+            selected[i] = best_f
+            bbox = np.asarray(best_f.bbox, dtype=np.float64)
+            prev_bbox = bbox
+            prev_area = max(1e-6, (bbox[2] - bbox[0]) * (bbox[3] - bbox[1]))
+            prev_emb = _get_face_embedding(best_f)
+            miss_count = 0
+        else:
+            miss_count += 1
+            if miss_count > RESET_AFTER_MISSES:
+                prev_bbox = None
+                prev_emb = None
+
+    return selected
+
+
 def smooth_face_angles(face_angles, window_size=5, alpha=0.4):
     """
-    对面部角度序列进行平滑处理，减少检测抖动
-    
+    对面部角度序列进行平滑处理，减少检测抖动。
+    缺失帧（None，未检测到脸）用相邻有效帧线性插值填充，
+    避免以 0.0 参与平滑导致跳过/混合判断失真。
+
     Args:
-        face_angles: 原始角度列表
+        face_angles: 原始角度列表（元素为 float 或 None）
         window_size: 中值滤波窗口大小
         alpha: EWMA平滑系数，越小越平滑
-    
+
     Returns:
         smoothed_angles: 平滑后的角度列表
     """
     import numpy as np
-    
+
     if len(face_angles) <= 1:
-        return face_angles.copy()
-    
-    angles = np.array(face_angles)
-    
+        return [0.0 if a is None else float(a) for a in face_angles]
+
+    # 第零步：填充缺失帧（未检测到脸）
+    valid_idx = [i for i, a in enumerate(face_angles) if a is not None]
+    if len(valid_idx) == 0:
+        return [0.0 for _ in face_angles]
+
+    filled = []
+    for i, a in enumerate(face_angles):
+        if a is not None:
+            filled.append(float(a))
+            continue
+        prev_candidates = [j for j in valid_idx if j < i]
+        next_candidates = [j for j in valid_idx if j > i]
+        prev_i = prev_candidates[-1] if prev_candidates else None
+        next_i = next_candidates[0] if next_candidates else None
+        if prev_i is not None and next_i is not None:
+            t = (i - prev_i) / float(next_i - prev_i)
+            filled.append(face_angles[prev_i] * (1.0 - t) + face_angles[next_i] * t)
+        elif prev_i is not None:
+            filled.append(float(face_angles[prev_i]))
+        else:
+            filled.append(float(face_angles[next_i]))
+
+    angles = np.array(filled)
+
     # 第一步：中值滤波消除异常值
     median_filtered = []
     half_window = window_size // 2
-    
+
     for i in range(len(angles)):
         start = max(0, i - half_window)
         end = min(len(angles), i + half_window + 1)
         window_values = angles[start:end]
         median_filtered.append(np.median(window_values))
-    
+
     # 第二步：指数加权移动平均（EWMA）进一步平滑
     smoothed = []
     smoothed.append(median_filtered[0])
-    
+
     for i in range(1, len(median_filtered)):
         ewma = alpha * median_filtered[i] + (1 - alpha) * smoothed[-1]
         smoothed.append(ewma)
-    
+
     return smoothed
 
 
@@ -661,68 +822,41 @@ def calculate_face_direction(face):
     return combined_angle
 
 
-def smooth_blend_values(face_angles, angle_threshold, window_size=7, alpha=0.5):
+def smooth_blend_values(face_angles, angle_threshold, **_):
     """
-    计算并平滑blend值（优化版）
-    
-    Args:
-        face_angles: 各帧的面部角度列表
-        angle_threshold: 角度阈值
-        window_size: 中值滤波窗口大小（默认7，更大窗口可以更好地消除波动）
-        alpha: EWMA平滑系数，越小越平滑（0.3-0.7推荐）
-    
-    Returns:
-        smoothed_weights: 平滑后的原始图像权重列表
-    """
-    import numpy as np
-    
-    # 设置平滑过渡区间（阈值前后5度）
-    transition_range = 5.0
-    transition_start = max(0, angle_threshold - transition_range)
-    transition_end = min(85.0, angle_threshold + transition_range)
+    由（已平滑的）逐帧角度计算 blend 权重（原图权重）。
 
-    # 计算原始blend权重，使用平滑的sigmoid过渡曲线
-    raw_weights = []
+    输入角度序列已经过 smooth_face_angles 平滑（中值+EWMA），
+    因此这里只做单调曲线映射，**不再对权重做时序平滑**：
+      - 旧版对权重再做中值+EWMA 会引入明显滞后（转折后好帧仍被混入原图），
+        且旧曲线在 threshold+5° 处不连续（smoothstep 段升到 1 后线性段又从 0 开始），
+        导致权重几乎到不了 1.0、软跳过失效、并产生鬼影；
+      - 单调映射保持角度序列的平滑性，无滞后、无跳变。
+
+    曲线：angle <= threshold -> 0（完全换脸）
+          angle >= threshold + 10 -> 1（完全还原原图，软跳过换脸）
+          中间 smoothstep 平滑过渡
+
+    Args:
+        face_angles: 各帧的（平滑后）面部角度列表
+        angle_threshold: 角度阈值
+
+    Returns:
+        weights: 逐帧原图权重列表（0=换脸，1=原图）
+    """
+    fade_end = float(angle_threshold) + 10.0
+    weights = []
     for angle in face_angles:
-        angle_abs = abs(angle)
-        if angle_abs >= 75.0:
-            weight = 1.0
-        elif angle_abs <= angle_threshold:
-            weight = 0.0
-        elif angle_abs >= transition_end:
-            # 过渡区间后段：线性过渡
-            weight = (angle_abs - transition_end) / (75.0 - transition_end)
-            weight = max(0.0, min(1.0, weight))
+        a = abs(float(angle))
+        if a <= angle_threshold:
+            w = 0.0
+        elif a >= fade_end:
+            w = 1.0
         else:
-            # 过渡区间前段：使用sigmoid平滑过渡
-            normalized = (angle_abs - angle_threshold) / transition_range
-            weight = normalized * normalized * (3 - 2 * normalized)  # smoothstep函数
-            weight = max(0.0, min(1.0, weight))
-        raw_weights.append(weight)
-    
-    # 如果只有一帧或没有帧，直接返回
-    if len(raw_weights) <= 1:
-        return raw_weights
-    
-    # 第一步：中值滤波消除异常值
-    median_filtered = []
-    half_window = window_size // 2
-    
-    for i in range(len(raw_weights)):
-        start = max(0, i - half_window)
-        end = min(len(raw_weights), i + half_window + 1)
-        window_values = raw_weights[start:end]
-        median_filtered.append(np.median(window_values))
-    
-    # 第二步：指数加权移动平均（EWMA）进一步平滑
-    smoothed_weights = []
-    smoothed_weights.append(median_filtered[0])
-    
-    for i in range(1, len(median_filtered)):
-        ewma = alpha * median_filtered[i] + (1 - alpha) * smoothed_weights[-1]
-        smoothed_weights.append(ewma)
-    
-    return smoothed_weights
+            t = (a - angle_threshold) / (fade_end - angle_threshold)
+            w = t * t * (3.0 - 2.0 * t)  # smoothstep
+        weights.append(max(0.0, min(1.0, w)))
+    return weights
 
 
 def swap_face(
@@ -924,9 +1058,11 @@ def swap_face_many(
 ):
     global SOURCE_FACES, SOURCE_IMAGE_HASH, TARGET_FACES, TARGET_IMAGE_HASH, TARGET_FACES_LIST, TARGET_IMAGE_LIST_HASH
     result_images = target_imgs
-    bbox = []
+    bbox = []  # 每帧一个列表: [[bbox,...], [], ...]，供 restore_face 按帧精确匹配
     swapped_indexes = []
     face_angles = []
+    smoothed_face_angles = []
+    blend_weights = []
 
     if model is not None:
 
@@ -982,20 +1118,19 @@ def swap_face_many(
 
         if source_faces is not None:
 
-            target_faces = []
-            face_angles = []
+            target_faces = []  # 每帧一个人脸列表（可能为空列表）
             pbar = progress_bar(len(target_imgs))
 
             if len(TARGET_IMAGE_LIST_HASH) > 0:
                 logger.status(f"Using Hashed Target Face(s) Model...")
             else:
                 logger.status(f"Analyzing Target Image...")
-            
+
             for i, target_img in enumerate(target_imgs):
                 if state.interrupted or model_management.processing_interrupted():
                     logger.status("Interrupted by User")
                     break
-                
+
                 target_image_md5hash = get_image_md5hash(target_img)
                 if len(TARGET_IMAGE_LIST_HASH) == 0:
                     TARGET_IMAGE_LIST_HASH = [target_image_md5hash]
@@ -1007,53 +1142,81 @@ def swap_face_many(
                     target_image_same = True if TARGET_IMAGE_LIST_HASH[i] == target_image_md5hash else False
                     if not target_image_same:
                         TARGET_IMAGE_LIST_HASH[i] = target_image_md5hash
-                
+
                 logger.info("(Image %s) Target Image MD5 Hash = %s", i, TARGET_IMAGE_LIST_HASH[i])
                 logger.info("(Image %s) Target Image the Same? %s", i, target_image_same)
 
                 if len(TARGET_FACES_LIST) == 0:
                     # logger.status(f"Analyzing Target Image {i}...")
-                    target_face = analyze_faces(target_img)
+                    target_face = analyze_faces(target_img, det_thresh=VIDEO_DET_THRESH)
                     TARGET_FACES_LIST = [target_face]
                 elif len(TARGET_FACES_LIST) == i and not target_image_same:
                     # logger.status(f"Analyzing Target Image {i}...")
-                    target_face = analyze_faces(target_img)
+                    target_face = analyze_faces(target_img, det_thresh=VIDEO_DET_THRESH)
                     TARGET_FACES_LIST.append(target_face)
                 elif len(TARGET_FACES_LIST) != i and not target_image_same:
                     # logger.status(f"Analyzing Target Image {i}...")
-                    target_face = analyze_faces(target_img)
+                    target_face = analyze_faces(target_img, det_thresh=VIDEO_DET_THRESH)
                     TARGET_FACES_LIST[i] = target_face
                 elif target_image_same:
                     # logger.status("(Image %s) Using Hashed Target Face(s) Model...", i)
                     target_face = TARGET_FACES_LIST[i]
-                
 
-                # logger.status(f"Analyzing Target Image {i}...")
-                # target_face = analyze_faces(target_img)
-                if target_face is not None:
-                    target_faces.append(target_face)
-                    # 计算第一张人脸的角度
-                    target_face_single, _, _ = get_face_single(target_img, target_face, face_index=faces_index[0], gender_target=gender_target, order=faces_order[0])
-                    if target_face_single is not None:
-                        face_angle = calculate_face_direction(target_face_single)
-                        face_angles.append(face_angle)
-                    else:
-                        face_angles.append(0.0)
-                else:
-                    face_angles.append(0.0)
-                
+                target_faces.append(target_face if target_face is not None else [])
+
                 pbar.update(1)
 
             progress_bar_reset(pbar)
-            
+
+            # 若分析被中断，补齐每帧条目，保证后续按帧索引访问不越界
+            while len(target_faces) < len(target_imgs):
+                target_faces.append([])
+
+            # No use in trying to swap faces if no faces are found, enhancement
+            if not any(len(tf) > 0 for tf in target_faces):
+                logger.status("Cannot detect any Target, skipping swapping...")
+                return result_images, bbox, swapped_indexes, face_angles, blend_weights
+
+            # 每帧一个 bbox 列表（与帧一一对应），供 restore_face 按帧精确匹配
+            bbox = [[] for _ in target_imgs]
+
+            # ---- 时序人脸跟踪：为每个目标槽位在全部帧中锁定同一个人 ----
+            # 逐帧独立选脸会在主角转头/运动模糊时跳选到背景人脸或漏检，
+            # 造成换脸/不换脸反复交替（闪烁）。
+            n_frames = len(target_imgs)
+            if gender_target != 0:
+                wanted_sex = "F" if gender_target == 1 else "M"
+                frames_for_track = [
+                    [f for f in tf if getattr(f, "sex", None) == wanted_sex] for tf in target_faces
+                ]
+            else:
+                frames_for_track = target_faces
+
+            tracked_lists = []
+            taken = [set() for _ in range(n_frames)]
+            for slot, face_num in enumerate(faces_index):
+                tracked = track_face_across_frames(frames_for_track, faces_order[0], slot=slot, taken=taken)
+                for i, f in enumerate(tracked):
+                    if f is not None:
+                        taken[i].add(id(f))
+                tracked_lists.append(tracked)
+
+            # ---- 用主槽位的跟踪结果计算逐帧角度（缺失帧为 None，平滑时自动插值） ----
+            primary_tracked = tracked_lists[0] if tracked_lists else [None] * n_frames
+            face_angles = [calculate_face_direction(f) if f is not None else None for f in primary_tracked]
+
             # 对角度序列进行平滑处理，减少检测抖动
             smoothed_face_angles = smooth_face_angles(face_angles)
-            logger.status(f"Face angles smoothed. Original: {[f'{a:.1f}' for a in face_angles[:10]]}... -> Smoothed: {[f'{a:.1f}' for a in smoothed_face_angles[:10]]}...")
-            
-            # No use in trying to swap faces if no faces are found, enhancement
-            if len(target_faces) == 0:
-                logger.status("Cannot detect any Target, skipping swapping...")
-                return result_images, bbox, swapped_indexes, face_angles
+            logger.status(
+                f"Face angles smoothed. Original: {[('n/a' if a is None else f'{a:.1f}') for a in face_angles[:10]]}... "
+                f"-> Smoothed: {[f'{a:.1f}' for a in smoothed_face_angles[:10]]}..."
+            )
+
+            # ---- 预计算 blend 权重，并以此做"软跳过" ----
+            # 旧逻辑：角度 > threshold 的帧直接不换脸（硬切换，输出闪烁）。
+            # 新逻辑：只要权重未到 1.0（未完全还原原图）就执行换脸，
+            #         过渡区间 [threshold, 75°] 由后处理按权重淡出，平滑无跳变。
+            blend_weights = smooth_blend_values(smoothed_face_angles, angle_threshold)
 
             if source_img is not None:
                 # separated management of wrong_gender between source and target, enhancement
@@ -1081,9 +1244,8 @@ def swap_face_many(
                 pbar = progress_bar(len(target_imgs))
 
                 logger.status(f"Swapping...")
-                for face_num in faces_index:
-                    # No use in trying to swap faces if no further faces are found, enhancement
-                    if face_num >= len(target_faces):
+                for slot, face_num in enumerate(faces_index):
+                    if slot >= len(tracked_lists):
                         logger.status("Checked all existing target faces, skipping swapping...")
                         break
 
@@ -1094,39 +1256,30 @@ def swap_face_many(
                     if source_face is not None and src_wrong_gender == 0:
                         # Reading results to make current face swap on a previous face result
                         # logger.status(f"Swapping...")
-                        for i, (target_img, target_face) in enumerate(zip(results, target_faces)):
-                            target_face_single, wrong_gender, target_face_index = get_face_single(target_img, target_face, face_index=face_num, gender_target=gender_target, order=faces_order[0])
-                            if target_face_single is not None and wrong_gender == 0:
-                                # 使用平滑后的角度
-                                face_angle = smoothed_face_angles[i]
-                                if abs(face_angle) <= angle_threshold:
-                                    result = target_img
-                                    if "hyperswap" in model:
-                                        swapped_face_256, M = run_hyperswap(face_swapper, source_face, target_face_single, result)
-                                        if swapped_face_256 is not None:
-                                            result = paste_back(result, swapped_face_256, M, crop_size=256)
-                                    elif face_boost_enabled:
-                                        logger.status(f"Face Boost is enabled (inswapper/reswapper only)")
-                                        bgr_fake, M = face_swapper.get(target_img, target_face_single, source_face, paste_back=False)
-                                        bgr_fake, scale = restorer.get_restored_face(bgr_fake, face_restore_model, face_restore_visibility, codeformer_weight, interpolation)
-                                        M *= scale
-                                        result = swapper.in_swap(target_img, bgr_fake, M)
-                                    else:
-                                        result = face_swapper.get(target_img, target_face_single, source_face)
-                                    results[i] = result
-                                    bbox.append(tuple(map(float, target_face_single.bbox)))
-                                    swapped_indexes.append(target_face_index)
-                                    pbar.update(1)
+                        tracked_slot = tracked_lists[slot]
+                        for i, target_img in enumerate(results):
+                            target_face_single = tracked_slot[i] if i < len(tracked_slot) else None
+                            # 软跳过：blend 权重达到 1.0（完全还原原图）才跳过，
+                            # 过渡区间照常换脸、由后处理淡出，避免相邻帧硬切换闪烁
+                            if target_face_single is not None and blend_weights[i] < 0.999:
+                                result = target_img
+                                if "hyperswap" in model:
+                                    swapped_face_256, M = run_hyperswap(face_swapper, source_face, target_face_single, result)
+                                    if swapped_face_256 is not None:
+                                        result = paste_back(result, swapped_face_256, M, crop_size=256)
+                                elif face_boost_enabled:
+                                    logger.status(f"Face Boost is enabled (inswapper/reswapper only)")
+                                    bgr_fake, M = face_swapper.get(target_img, target_face_single, source_face, paste_back=False)
+                                    bgr_fake, scale = restorer.get_restored_face(bgr_fake, face_restore_model, face_restore_visibility, codeformer_weight, interpolation)
+                                    M *= scale
+                                    result = swapper.in_swap(target_img, bgr_fake, M)
                                 else:
-                                    # logger.status(f"Face direction angle {abs(face_angle):.2f}° exceeds threshold {angle_threshold}°, skipping swap")
-                                    pbar.update(1)
-                            elif wrong_gender == 1:
-                                wrong_gender = 0
-                                logger.status("Wrong target gender detected")
+                                    result = face_swapper.get(target_img, target_face_single, source_face)
+                                results[i] = result
+                                bbox[i].append(tuple(map(float, target_face_single.bbox)))
+                                swapped_indexes.append(face_num)
                                 pbar.update(1)
-                                continue
                             else:
-                                logger.info(f"{i}: No target face found for {face_num}")
                                 pbar.update(1)
                     elif src_wrong_gender == 1:
                         src_wrong_gender = 0
@@ -1143,4 +1296,4 @@ def swap_face_many(
                 logger.status("No source face(s) in the provided Index")
         else:
             logger.status("No source face(s) found")
-    return result_images, bbox, swapped_indexes, smoothed_face_angles
+    return result_images, bbox, swapped_indexes, smoothed_face_angles, blend_weights

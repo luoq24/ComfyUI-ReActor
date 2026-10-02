@@ -106,6 +106,7 @@ class FaceSwapScript(scripts.Script):
             if isinstance(p, ProcessingImg2Img) and swap_in_source:
                 logger.status(f"Working: source face index %s, target face index %s", self.source_faces_index, self.faces_index)
                 p.face_angles = []
+                p.face_blend_weights = []
 
                 if len(p.init_images) == 1:
 
@@ -132,7 +133,7 @@ class FaceSwapScript(scripts.Script):
                     p.face_angles = []
 
                 elif len(p.init_images) > 1:
-                    result, bbox, swapped_indexes, face_angles = swap_face_many(
+                    result, bbox, swapped_indexes, face_angles, face_blend_weights = swap_face_many(
                             self.source,
                             p.init_images,
                             source_faces_index=self.source_faces_index,
@@ -153,5 +154,6 @@ class FaceSwapScript(scripts.Script):
                     p.bbox = bbox
                     p.swapped_indexes = swapped_indexes
                     p.face_angles = face_angles
+                    p.face_blend_weights = face_blend_weights
 
                 logger.status("--Done!--")
