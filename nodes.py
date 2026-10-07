@@ -63,7 +63,8 @@ from r_basicsr.utils.registry import ARCH_REGISTRY
 import scripts.r_archs.codeformer_arch
 import scripts.r_masking.core as core
 
-import scripts.reactor_sfw as sfw
+# NSFW check disabled: skip importing reactor_sfw (avoids loading transformers at startup)
+# import scripts.reactor_sfw as sfw
 
 
 models_dir = folder_paths.models_dir
@@ -471,23 +472,23 @@ class reactor:
         script = FaceSwapScript()
         pil_images = batch_tensor_to_pil(input_image)
 
-        # NSFW checker
-        logger.status("Checking for any unsafe content...")
-        pbar = progress_bar(len(pil_images))
-        pil_images_sfw = []
-        for img in pil_images:
-            if state.interrupted or model_management.processing_interrupted():
-                logger.status("Interrupted by User")
-                break
-            img_byte_arr = io.BytesIO()
-            img.save(img_byte_arr, format='PNG')
-            img_byte_arr = img_byte_arr.getvalue()
-            if not sfw.nsfw_image(img_byte_arr, NSFWDET_MODEL_PATH):
-                pil_images_sfw.append(img)
-            pbar.update(1)
-        pil_images = pil_images_sfw
+        # NSFW checker (disabled: no model load, no PNG re-encoding per image)
+        # logger.status("Checking for any unsafe content...")
+        # pbar = progress_bar(len(pil_images))
+        # pil_images_sfw = []
+        # for img in pil_images:
+        #     if state.interrupted or model_management.processing_interrupted():
+        #         logger.status("Interrupted by User")
+        #         break
+        #     img_byte_arr = io.BytesIO()
+        #     img.save(img_byte_arr, format='PNG')
+        #     img_byte_arr = img_byte_arr.getvalue()
+        #     if not sfw.nsfw_image(img_byte_arr, NSFWDET_MODEL_PATH):
+        #         pil_images_sfw.append(img)
+        #     pbar.update(1)
+        # pil_images = pil_images_sfw
         # # #
-        progress_bar_reset(pbar)
+        # progress_bar_reset(pbar)
 
         if len(pil_images) > 0:
 
