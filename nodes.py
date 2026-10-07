@@ -1,5 +1,6 @@
 import os, glob, sys
 import logging
+import time as _time
 
 import torch
 import torch.nn.functional as F
@@ -136,13 +137,14 @@ def build_swap_mask(input_image, result, eps=0.05, dilate_px=6):
     换脸（含 GFPGAN/blend）只在脸部区域改像素，两图在区域外逐像素相同——
     差分就是换脸区域的像素级精确描述，零检测、零模型。"""
     k = dilate_px * 2 + 1
+    # 差分/膨胀搬上 GPU：243 帧 CPU max_pool2d 约 29s，GPU 约 3s
+    device = torch.device("cuda") if torch.cuda.is_available() else result.device
     masks = []
-    step = 8
+    step = 32
     for s in range(0, int(result.shape[0]), step):
         e = min(s + step, int(result.shape[0]))
-        # result 在计算设备上（换脸尾部），input 通常在 CPU——统一到 result 的设备再差分
-        r = result[s:e].float()
-        i = input_image[s:e].float().to(r.device)
+        r = result[s:e].float().to(device)
+        i = input_image[s:e].float().to(device)
         d = (r - i).abs().mean(dim=-1)
         m = (d > eps).float().unsqueeze(1)
         m = F.max_pool2d(m, kernel_size=k, stride=1, padding=dilate_px)
@@ -302,6 +304,8 @@ class reactor:
                 
                 # restored_face = None
                 restored_faces = []
+                # 与 cropped_faces 对齐的标记：True=该脸真正经过了修复模型
+                restored_flags = []
                 
                 # берем сохранённые bbox из swap (или None)
                 # swap 阶段现按帧记录 bbox（每帧一个列表），此处只与当前帧
@@ -387,24 +391,33 @@ class reactor:
                                     restored_face = tensor2img(output, rgb2bgr=True, min_max=(-1, 1))
 
                             del output
-                            torch.cuda.empty_cache()
 
                         except Exception as error:
 
                             print(f"\tFailed inference: {error}", file=sys.stderr)
                             # restored_face = tensor2img(cropped_face_t, rgb2bgr=True, min_max=(-1, 1))
                             restored_face = cropped_face.copy()
-                        
+
                     else:
                         restored_face = cropped_face.copy()
-                    
+
                     if face_restore_visibility < 1:
                         restored_face = cropped_face * (1 - face_restore_visibility) + restored_face * face_restore_visibility
 
                     restored_face = restored_face.astype("uint8")
                     self.face_helper.add_restored_face(restored_face)
-                
+                    restored_flags.append(bool(do_restore))
+
                 self.face_helper.get_inverse_affine(None)
+
+                # 只回贴真正修复过的脸：未修复的脸本来就是输入像素，
+                # 跳过其全帧合成（每张脸一次全帧 float 运算，视频场景 paste
+                # 阶段的大头）。paste 内部断言 restored_faces 与
+                # inverse_affine_matrices 等长，两者需同步裁剪。
+                if not all(restored_flags):
+                    keep = [i for i, f in enumerate(restored_flags) if f]
+                    self.face_helper.restored_faces = [self.face_helper.restored_faces[i] for i in keep]
+                    self.face_helper.inverse_affine_matrices = [self.face_helper.inverse_affine_matrices[i] for i in keep]
 
                 restored_img = self.face_helper.paste_faces_to_input_image()
                 restored_img = restored_img[:, :, ::-1]
@@ -472,6 +485,8 @@ class reactor:
         script = FaceSwapScript()
         pil_images = batch_tensor_to_pil(input_image)
 
+        _t_swap = _time.perf_counter()
+
         # NSFW checker (disabled: no model load, no PNG re-encoding per image)
         # logger.status("Checking for any unsafe content...")
         # pbar = progress_bar(len(pil_images))
@@ -520,6 +535,7 @@ class reactor:
                 angle_threshold=angle_threshold,
             )
             result = batched_pil_to_tensor(p.init_images)
+            logger.status(f"[timing] faceswap phase: {_time.perf_counter() - _t_swap:.1f}s ({len(pil_images)} frames)")
             # print(f"bbox={p.bbox}")
             if len(p.bbox) > 0:
                 # 统一为"每帧一组bbox"的结构，供 restore_face 按帧精确匹配；
@@ -541,7 +557,9 @@ class reactor:
                 face_model_to_provide = face_model
 
             if self.restore or not self.face_boost_enabled:
+                _t_restore = _time.perf_counter()
                 result = reactor.restore_face(self,result,face_restore_model,face_restore_visibility,codeformer_weight,facedetection)
+                logger.status(f"[timing] restore phase: {_time.perf_counter() - _t_restore:.1f}s")
 
             # 应用平滑blend
             if hasattr(p, 'face_angles') and len(p.face_angles) > 0 and len(original_image) == len(p.face_angles):
@@ -583,7 +601,9 @@ class reactor:
             original_image = result
 
         # 换脸区域 mask：|result - original| 的像素级差分（含 GFPGAN/blend 的改动）
+        _t_mask = _time.perf_counter()
         swap_mask = build_swap_mask(original_image, result)
+        logger.status(f"[timing] swap_mask phase: {_time.perf_counter() - _t_mask:.1f}s")
         return (result,face_model_to_provide,original_image,swap_mask)
 
 
@@ -1631,9 +1651,13 @@ class MaskHelper:
                 if len(centers) == 2:
                     d = float(np.linalg.norm(centers[0] - centers[1]))
                     # Implausible eye pair (inter-ocular distance / vertical alignment)
-                    if not (0.08 * face_w <= d <= 0.75 * face_w) or abs(centers[0][1] - centers[1][1]) > 0.5 * d:
+                    # 垂直差阈值需容忍头部 roll（平面内倾斜）：roll 40° 时
+                    # dy ≈ 0.64*d，旧阈值 0.5*d 会把明显侧倾的脸误判为垃圾
+                    # 检测而跳过（整帧无眼洞→眼睛不被保留）。0.8*d 对应
+                    # roll≈53°，仍能拦住两眼近乎垂直排列的退化关键点。
+                    if not (0.08 * face_w <= d <= 0.75 * face_w) or abs(centers[0][1] - centers[1][1]) > 0.8 * d:
                         if dbg:
-                            logger.status(f"mask_eyes[dbg] f{i}: implausible eye pair (d={d:.0f}px, face_w={face_w:.0f}px), face skipped")
+                            logger.status(f"mask_eyes[dbg] f{i}: implausible eye pair (d={d:.0f}px, dy={abs(centers[0][1] - centers[1][1]):.0f}px, face_w={face_w:.0f}px), face skipped")
                         continue
                 for ri, (pts, center) in enumerate(zip(ring_pts, centers)):
                     ring_diam = float(np.linalg.norm(pts.max(axis=0) - pts.min(axis=0)))
@@ -1752,7 +1776,9 @@ class MaskHelper:
 
         # Preserve original eyes: exclude eye regions from the swap mask (authoritative RetinaFace detection)
         if mask_eyes:
+            _t_eyes = _time.perf_counter()
             eye_mask = self._build_eye_mask(image, eye_size, eye_dilation, eye_feather, region_mask=combined_mask)
+            logger.status(f"[timing] mask_eyes phase: {_time.perf_counter() - _t_eyes:.1f}s ({image.shape[0]} frames)")
             eye_mask = eye_mask.to(device=combined_mask.device, dtype=combined_mask.dtype)
             if eye_mask.shape[0] != combined_mask.shape[0]:
                 raise RuntimeError(f"mask_eyes: eye batch {eye_mask.shape[0]} doesn't match mask batch {combined_mask.shape[0]}")

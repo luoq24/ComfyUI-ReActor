@@ -1,5 +1,6 @@
 import os
 import shutil
+import time as _time
 from typing import List, Union
 
 import cv2
@@ -1120,6 +1121,7 @@ def swap_face_many(
 
             target_faces = []  # 每帧一个人脸列表（可能为空列表）
             pbar = progress_bar(len(target_imgs))
+            _t_analyze = _time.perf_counter()
 
             if len(TARGET_IMAGE_LIST_HASH) > 0:
                 logger.status(f"Using Hashed Target Face(s) Model...")
@@ -1167,6 +1169,7 @@ def swap_face_many(
                 pbar.update(1)
 
             progress_bar_reset(pbar)
+            logger.status(f"[timing] face analyze phase: {_time.perf_counter() - _t_analyze:.1f}s ({len(target_imgs)} frames)")
 
             # 若分析被中断，补齐每帧条目，保证后续按帧索引访问不越界
             while len(target_faces) < len(target_imgs):
@@ -1242,6 +1245,7 @@ def swap_face_many(
                 source_face_idx = 0
 
                 pbar = progress_bar(len(target_imgs))
+                _t_swap_loop = _time.perf_counter()
 
                 logger.status(f"Swapping...")
                 for slot, face_num in enumerate(faces_index):
@@ -1289,6 +1293,7 @@ def swap_face_many(
                         logger.status(f"No source face found for face number {source_face_idx}.")
 
                 progress_bar_reset(pbar)
+                logger.status(f"[timing] face swap loop: {_time.perf_counter() - _t_swap_loop:.1f}s")
 
                 result_images = [Image.fromarray(cv2.cvtColor(result, cv2.COLOR_BGR2RGB)) for result in results]
 
