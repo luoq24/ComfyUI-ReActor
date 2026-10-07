@@ -15,7 +15,6 @@ from PIL import Image
 import io
 from scipy import stats
 from insightface.app.common import Face
-from segment_anything import sam_model_registry
 
 from modules.processing import ProcessingImg2Img
 from modules.shared import state
@@ -62,9 +61,7 @@ from reactor_patcher import apply_patch
 from r_facelib.utils.face_restoration_helper import FaceRestoreHelper
 from r_basicsr.utils.registry import ARCH_REGISTRY
 import scripts.r_archs.codeformer_arch
-import scripts.r_masking.subcore as subcore
 import scripts.r_masking.core as core
-import scripts.r_masking.segs as masking_segs
 
 import scripts.reactor_sfw as sfw
 
@@ -133,6 +130,25 @@ def model_names():
     return {os.path.basename(x): x for x in models}
 
 
+def build_swap_mask(input_image, result, eps=0.05, dilate_px=6):
+    """换脸区域 = |swapped - original| 的 RGB 均值 > eps，再膨胀 dilate_px。
+    换脸（含 GFPGAN/blend）只在脸部区域改像素，两图在区域外逐像素相同——
+    差分就是换脸区域的像素级精确描述，零检测、零模型。"""
+    k = dilate_px * 2 + 1
+    masks = []
+    step = 8
+    for s in range(0, int(result.shape[0]), step):
+        e = min(s + step, int(result.shape[0]))
+        # result 在计算设备上（换脸尾部），input 通常在 CPU——统一到 result 的设备再差分
+        r = result[s:e].float()
+        i = input_image[s:e].float().to(r.device)
+        d = (r - i).abs().mean(dim=-1)
+        m = (d > eps).float().unsqueeze(1)
+        m = F.max_pool2d(m, kernel_size=k, stride=1, padding=dilate_px)
+        masks.append(m.squeeze(1).cpu())
+    return torch.cat(masks, dim=0) if masks else None
+
+
 class reactor:
     @classmethod
     def INPUT_TYPES(s):
@@ -159,8 +175,8 @@ class reactor:
             "hidden": {"faces_order": "FACES_ORDER"},
         }
 
-    RETURN_TYPES = ("IMAGE","FACE_MODEL","IMAGE")
-    RETURN_NAMES = ("SWAPPED_IMAGE","FACE_MODEL","ORIGINAL_IMAGE")
+    RETURN_TYPES = ("IMAGE","FACE_MODEL","IMAGE","MASK")
+    RETURN_NAMES = ("SWAPPED_IMAGE","FACE_MODEL","ORIGINAL_IMAGE","SWAP_MASK")
     FUNCTION = "execute"
     CATEGORY = "🌌 ReActor"
 
@@ -565,7 +581,9 @@ class reactor:
             face_model_to_provide = None
             original_image = result
 
-        return (result,face_model_to_provide,original_image)
+        # 换脸区域 mask：|result - original| 的像素级差分（含 GFPGAN/blend 的改动）
+        swap_mask = build_swap_mask(original_image, result)
+        return (result,face_model_to_provide,original_image,swap_mask)
 
 
 class ReActorPlusOpt:
@@ -590,8 +608,8 @@ class ReActorPlusOpt:
             }
         }
 
-    RETURN_TYPES = ("IMAGE","FACE_MODEL","IMAGE")
-    RETURN_NAMES = ("SWAPPED_IMAGE","FACE_MODEL","ORIGINAL_IMAGE")
+    RETURN_TYPES = ("IMAGE","FACE_MODEL","IMAGE","MASK")
+    RETURN_NAMES = ("SWAPPED_IMAGE","FACE_MODEL","ORIGINAL_IMAGE","SWAP_MASK")
     FUNCTION = "execute"
     CATEGORY = "🌌 ReActor"
 
@@ -658,8 +676,8 @@ class ReActorPlusOptWithDirection:
             }
         }
 
-    RETURN_TYPES = ("IMAGE","FACE_MODEL","IMAGE")
-    RETURN_NAMES = ("SWAPPED_IMAGE","FACE_MODEL","ORIGINAL_IMAGE")
+    RETURN_TYPES = ("IMAGE","FACE_MODEL","IMAGE","MASK")
+    RETURN_NAMES = ("SWAPPED_IMAGE","FACE_MODEL","ORIGINAL_IMAGE","SWAP_MASK")
     FUNCTION = "execute"
     CATEGORY = "🌌 ReActor"
 
@@ -1303,56 +1321,33 @@ class RestoreFaceAdvanced:
 # each run (heavy VRAM alloc/dealloc churn — on a full GPU the session init can
 # fail with bad allocation and even take the process down).
 _FACE_AUTHORITY_CACHE = {}
-# Code-level constant (like _eye_debug): max faces detected per frame for the
-# box mask / eye holes. Raise it for group videos. ReActor's typical 1-face
-# workflow never needs more than the default.
-_MASK_MAX_FACES = 4
 
 
 class MaskHelper:
     def __init__(self):
-        self.labels = "all"
-        self.detailer_hook = None
-        self.device_mode = "AUTO"
-        self.detection_hint = "center-1"
-        self._sam_cache = {}
-        self._bbox_cache = {}
         self._blur_cache = {}
         self._eye_debug = False
 
     @classmethod
     def INPUT_TYPES(s):
-        bboxs = ["bbox/"+x for x in folder_paths.get_filename_list("ultralytics_bbox")]
-        segms = ["segm/"+x for x in folder_paths.get_filename_list("ultralytics_segm")]
-        sam_models = [x for x in folder_paths.get_filename_list("sams") if 'hq' not in x]
         return {
             "required": {
                 "image": ("IMAGE",),
                 "swapped_image": ("IMAGE",),
-                "bbox_model_name": (bboxs + segms, ),
-                "bbox_threshold": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "bbox_dilation": ("INT", {"default": 10, "min": -512, "max": 512, "step": 1}),
-                "bbox_crop_factor": ("FLOAT", {"default": 3.0, "min": 1.0, "max": 100, "step": 0.1}),
-                "bbox_drop_size": ("INT", {"min": 1, "max": 8192, "step": 1, "default": 10}),
-                "sam_model_name": (sam_models, ),
-                "sam_dilation": ("INT", {"default": 0, "min": -512, "max": 512, "step": 1}),
-                "sam_threshold": ("FLOAT", {"default": 0.93, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "bbox_expansion": ("INT", {"default": 0, "min": 0, "max": 1000, "step": 1}),
-                "mask_hint_threshold": ("FLOAT", {"default": 0.7, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "mask_hint_use_negative": (["False", "Small", "Outter"], ),
+                # 必需输入：ReActor 的 SWAP_MASK 输出。不连线 = 工作流未建全，
+                # ComfyUI 直接标红，不做任何静默兜底（有利于统一链路与排查）。
+                "swap_mask": ("MASK",),
                 "morphology_operation": (["dilate", "erode", "open", "close"],),
                 "morphology_distance": ("INT", {"default": 0, "min": 0, "max": 128, "step": 1}),
                 "blur_radius": ("INT", {"default": 9, "min": 0, "max": 48, "step": 1}),
                 "sigma_factor": ("FLOAT", {"default": 1.0, "min": 0.01, "max": 3., "step": 0.01}),
-            },
-            "optional": {
-                "mask_optional": ("MASK",),
                 "mask_eyes": ("BOOLEAN", {"default": False, "label_off": "no", "label_on": "yes"}),
                 "eye_size": ("FLOAT", {"default": 1.2, "min": 0.5, "max": 2.5, "step": 0.05}),
                 "eye_dilation": ("INT", {"default": 6, "min": 0, "max": 64, "step": 1}),
                 "eye_feather": ("INT", {"default": 12, "min": 0, "max": 64, "step": 1}),
-                "box_mask": ("BOOLEAN", {"default": False, "label_off": "no", "label_on": "yes"}),
-                "box_mask_pad": ("INT", {"default": 16, "min": 0, "max": 64, "step": 1}),
+            },
+            "optional": {
+                "mask_optional": ("MASK",),
             }
         }
 
@@ -1394,8 +1389,7 @@ class MaskHelper:
                 last_err = e
                 logger.warning(f"mask_eyes: insightface init failed with providers={provs} ({e})")
         if app is None:
-            logger.warning(f"mask_eyes: insightface detector unavailable ({last_err}), eye preservation disabled")
-            return None
+            raise RuntimeError(f"mask_eyes: insightface detector unavailable ({last_err})")
         _FACE_AUTHORITY_CACHE["app"] = app
         return app
 
@@ -1440,23 +1434,45 @@ class MaskHelper:
             "eye_src": "kps",
         }
 
-    def _detect_eye_faces(self, frames, dbg=False):
+    def _detect_eye_faces(self, frames, region_mask=None, dbg=False):
         """Per-frame authoritative face detection (RetinaFace) with eye-ring
-        geometry. One canonical detection per real face keeps the holes stable."""
+        geometry. One canonical detection per real face keeps the holes stable.
+
+        Two-stage: boxes first, then landmarks only for faces inside the swap
+        region. Per-face 68-point landmark inference (~16ms/face on CPU)
+        dominates detection in crowd scenes, and faces outside the swap region
+        never need holes — their landmarks are pure waste."""
         app = self._get_face_authority()
-        if app is None:
-            return None
         results = []
         for i, frame in enumerate(frames):
             bgr = np.ascontiguousarray(frame[:, :, ::-1])
-            try:
-                faces = app.get(bgr, max_num=_MASK_MAX_FACES)
-            except Exception as e:
-                logger.warning(f"mask_eyes: detection failed on frame {i}: {e}")
-                faces = []
+            # 检测异常直接抛出：静默吞掉只会留下"眼洞没打上"的难查结果。
+            # 不传 max_num：insightface 在 max_num>0 时按"面积−2×到图中心距离²"
+            # 选脸（center-bias 启发式），人群场景会把远离中心的主体大脸挤掉、
+            # 只留中心附近的小脸——主体脸眼洞漏打，眼睛被 GFPGAN 重画。
+            # 两段式精确复刻 insightface 0.7.3 FaceAnalysis.get()，只是把
+            # 68 点关键点推理推迟到区域过滤之后。
+            bboxes, kpss = app.det_model.detect(bgr, max_num=0, metric="default")
+            frame_region = None
+            if region_mask is not None:
+                frame_region = (region_mask[i] > 0.5).cpu().numpy()
             entries = []
-            for f in sorted(faces, key=lambda f: -float(getattr(f, "det_score", 0.0)))[:_MASK_MAX_FACES]:
-                e = self._eye_entries_from_face(f)
+            for j in range(bboxes.shape[0]):
+                bbox = bboxes[j, 0:4]
+                if frame_region is not None:
+                    # bbox 外扩 8px 后与换脸区域求交：无交集的脸不换、不需要眼洞
+                    x1, y1 = max(int(bbox[0]) - 8, 0), max(int(bbox[1]) - 8, 0)
+                    x2 = min(int(bbox[2]) + 8, frame_region.shape[1])
+                    y2 = min(int(bbox[3]) + 8, frame_region.shape[0])
+                    if x2 <= x1 or y2 <= y1 or not frame_region[y1:y2, x1:x2].any():
+                        continue
+                kps = kpss[j] if kpss is not None else None
+                face = Face(bbox=bbox, kps=kps, det_score=bboxes[j, 4])
+                for taskname, model in app.models.items():
+                    if taskname == "detection":
+                        continue
+                    model.get(bgr, face)
+                e = self._eye_entries_from_face(face)
                 if e is not None:
                     entries.append(e)
             results.append(entries)
@@ -1578,7 +1594,7 @@ class MaskHelper:
             t = t.unsqueeze(0)
         return t.clamp(0, 1).mul(255.0).add(0.5).to(torch.uint8).cpu().numpy()
 
-    def _build_eye_mask(self, image, eye_size, eye_dilation, eye_feather=12):
+    def _build_eye_mask(self, image, eye_size, eye_dilation, eye_feather=12, region_mask=None):
         """Punch eye holes into the swap mask. Faces come from the authoritative
         RetinaFace detector (junk-free) with eye rings from its 68-point landmarks
         (kps-ellipse fallback). Two-scale holes: a solid core over the eye opening
@@ -1586,22 +1602,25 @@ class MaskHelper:
         dbg = self._eye_debug
         img = image if image.ndim == 4 else image.unsqueeze(0)
         B, H, W = img.shape[0], img.shape[1], img.shape[2]
-        faces_per_frame = self._detect_eye_faces(list(self._to_uint8_frames(img)), dbg=dbg)
-        if faces_per_frame is None:
-            return None
-        return self._eye_mask_from_faces(faces_per_frame, B, H, W, eye_size, eye_dilation, eye_feather, dbg=dbg)
+        faces_per_frame = self._detect_eye_faces(list(self._to_uint8_frames(img)), region_mask=region_mask, dbg=dbg)
+        return self._eye_mask_from_faces(faces_per_frame, B, H, W, eye_size, eye_dilation, eye_feather, dbg=dbg, region_mask=region_mask)
 
-    def _eye_mask_from_faces(self, faces_per_frame, B, H, W, eye_size, eye_dilation, eye_feather=12, dbg=False):
+    def _eye_mask_from_faces(self, faces_per_frame, B, H, W, eye_size, eye_dilation, eye_feather=12, dbg=False, region_mask=None):
         """Draw the two-scale eye holes (solid core + feathered outer ramp) for the
-        given per-frame face entries. Returns a (B, H, W) float tensor."""
+        given per-frame face entries. Returns a (B, H, W) float tensor.
+
+        绘制局部化：逐脸全帧 GaussianBlur 是眼洞绘制的大头（768x1344 每脸
+        ~13ms）。该脸的 outer mask 在多边形支撑域外本来就是 0，所以在"多边形
+        外扩模糊核半径"的局部裁剪里画+补零模糊（BORDER_CONSTANT 与全帧逐位
+        等价），再整块贴回；裁剪触及图像边界时回退全帧（reflect 边界行为
+        与补零不等价）。"""
         masks = []
         failed_frames = []
         for i in range(B):
             core_m = np.zeros((H, W), dtype=np.float32)
-            outer_m = np.zeros((H, W), dtype=np.float32)
+            outer_acc = np.zeros((H, W), dtype=np.float32)
             per_frame = faces_per_frame[i]
-            if not per_frame:
-                failed_frames.append(i)
+            rings_drawn = 0
             for face in per_frame:
                 lmks = face["landmarks_xy"]
                 x1, y1, x2, y2 = face["bbox_xyxy"]
@@ -1637,176 +1656,84 @@ class MaskHelper:
                     core_pts = center + (pts - center) * float(eye_size)
                     outer_pts = center + (pts - center) * (float(eye_size) + margin / max(rad, 1.0))
                     cv2.fillPoly(core_m, [np.round(core_pts).astype(np.int32)], 1.0)
-                    cv2.fillPoly(outer_m, [np.round(outer_pts).astype(np.int32)], 1.0)
-            # Wide feather on the outer boundary only: the tone step between the
-            # original pixels (inside) and the per-frame regenerated swapped skin
-            # (outside) is what flickers at nose wings / cheeks — a wide static
-            # ramp makes it imperceptible. The core keeps the eye opening solid.
-            if eye_feather > 0:
-                outer_m = cv2.GaussianBlur(outer_m, (0, 0), sigmaX=float(eye_feather))
-                mx = float(outer_m.max())
-                if mx > 0:
-                    outer_m = outer_m / mx
-            m = np.maximum(core_m, outer_m)
+                    rings_drawn += 1
+                    # 羽化半径按人脸宽度自适应：固定 sigma 在小脸上（如 35px）会把
+                    # 眼洞羽化扩散到整张脸，(1-eye) 大面积压低换脸权重，看起来像
+                    # "没有换脸"。sigma = min(eye_feather, 0.12*face_w)：
+                    # face_w>=100px 时与旧的全局行为完全一致，小脸则按比例收缩。
+                    sigma = float(min(eye_feather, max(0.12 * face_w, 1.0)))
+                    if eye_feather > 0 and sigma > 0:
+                        # 绘制局部化：该脸 outer mask 在多边形支撑域外本来就是 0，
+                        # 在"多边形外扩模糊核半径"的局部裁剪里画+补零模糊
+                        # （BORDER_CONSTANT 与全帧逐位等价）再贴回。OpenCV float32
+                        # 自动核尺寸 ≈ 8σ+1（半径 ~4σ），外扩取 4σ+2 宁大勿小。
+                        # 裁剪触及图像边界时回退全帧：全帧模糊在图像边界是
+                        # reflect 模式，与补零不等价（眼部贴边的极端构图）。
+                        krad = int(4 * sigma) + 2
+                        px0 = int(np.floor(float(outer_pts[:, 0].min()))) - krad
+                        py0 = int(np.floor(float(outer_pts[:, 1].min()))) - krad
+                        px1 = int(np.ceil(float(outer_pts[:, 0].max()))) + krad + 1
+                        py1 = int(np.ceil(float(outer_pts[:, 1].max()))) + krad + 1
+                        if px0 < 0 or py0 < 0 or px1 > W or py1 > H:
+                            face_outer = np.zeros((H, W), dtype=np.float32)
+                            cv2.fillPoly(face_outer, [np.round(outer_pts).astype(np.int32)], 1.0)
+                            face_outer = cv2.GaussianBlur(face_outer, (0, 0), sigmaX=sigma)
+                            mx = float(face_outer.max())
+                            if mx > 0:
+                                face_outer = face_outer / mx
+                            np.maximum(outer_acc, face_outer, out=outer_acc)
+                        else:
+                            face_outer = np.zeros((py1 - py0, px1 - px0), dtype=np.float32)
+                            cv2.fillPoly(face_outer, [np.round(outer_pts).astype(np.int32) - (px0, py0)], 1.0)
+                            face_outer = cv2.GaussianBlur(face_outer, (0, 0), sigmaX=sigma, borderType=cv2.BORDER_CONSTANT)
+                            mx = float(face_outer.max())
+                            if mx > 0:
+                                face_outer = face_outer / mx
+                            np.maximum(outer_acc[py0:py1, px0:px1], face_outer, out=outer_acc[py0:py1, px0:px1])
+                    else:
+                        cv2.fillPoly(outer_acc, [np.round(outer_pts).astype(np.int32)], 1.0)
+            m = np.maximum(core_m, outer_acc)
+            if region_mask is not None:
+                region_present = bool((region_mask[i] > 0.5).any())
+            else:
+                region_present = True
+            if rings_drawn == 0 and (per_frame or region_present):
+                # 眼洞为空且确实有东西要保护：脸已检测到但关键点退化，或换脸
+                # 区域匹配不到任何脸——该帧输出=完全换后脸。必须显式报告，
+                # 不能伪装成成功。区域缺席的帧（人脸尚未入镜）不算失败。
+                failed_frames.append(i)
             masks.append(torch.from_numpy(m))
         if failed_frames:
             shown = str(failed_frames[:10]).rstrip(']')
             suffix = ", ..." if len(failed_frames) > 10 else "]"
-            logger.status(f"mask_eyes: no eyes detected on frame(s) {shown}{suffix} out of {B} — those keep the fully swapped face")
+            logger.warning(f"mask_eyes: no usable eyes on frame(s) {shown}{suffix} out of {B} — those frames keep the FULLY SWAPPED face (no eye preservation)")
         else:
             logger.status(f"mask_eyes: eye regions excluded from the swap mask in all {B} frames")
         return torch.stack(masks)
 
-    def execute(self, image, swapped_image, bbox_model_name, bbox_threshold, bbox_dilation, bbox_crop_factor, bbox_drop_size, sam_model_name, sam_dilation, sam_threshold, bbox_expansion, mask_hint_threshold, mask_hint_use_negative, morphology_operation, morphology_distance, blur_radius, sigma_factor, mask_optional=None, mask_eyes=False, eye_size=1.2, eye_dilation=6, eye_feather=12, box_mask=False, box_mask_pad=16):
+    def execute(self, image, swapped_image, swap_mask, morphology_operation, morphology_distance, blur_radius, sigma_factor, mask_eyes, eye_size, eye_dilation, eye_feather, mask_optional=None):
         device = model_management.get_torch_device()
         # self._eye_debug: code-level constant (see __init__), not exposed in the UI
 
         # ВАЖНО: не перемещаем image/swapped_image на GPU целиком. Для видео (сотни
-        # кадров) полный fp32-батч занимает гигабайты VRAM; под таким давлением
-        # драйвер падает с "Windows fatal exception: access violation" при первом
-        # же крупном копировании D2H. Батчи остаются на CPU — на GPU попадают только
-        # погранные срезы при композитинге (fast path ниже) или весь батч в generic
-        # path (там это было и раньше). Детекция спокойно работает с CPU-срезами:
-        # tensor_to_pil / make_sam_mask_segmented делают .cpu() сами.
+        # кадров) полный fp32-батч занимает гигабайты VRAM. Батчи остаются на CPU —
+        # на GPU попадают только погранные срезы при композитинге (fast path ниже)
+        # или весь батч в generic path.
 
-        combined_mask = None
-        faces_for_mask = None
-        if mask_optional is not None:
-            combined_mask = mask_optional
-        elif box_mask:
-            # Box mask: per-frame rectangles from the authoritative detector — the
-            # same detection family GFPGAN's restore crop is derived from, so the
-            # composite boundary lands OUTSIDE the altered region (where the
-            # swapped frame equals the original) and its per-frame wobble is
-            # invisible. Scales with the face size, unlike a fixed dilation of
-            # the SAM silhouette.
-            H, W = int(image.shape[1]), int(image.shape[2])
-            faces_for_mask = self._detect_eye_faces(list(self._to_uint8_frames(image)), dbg=self._eye_debug)
-            if faces_for_mask is not None:
-                cm_list = []
-                pad = float(box_mask_pad)
-                for faces in faces_for_mask:
-                    m = torch.zeros((H, W), dtype=torch.float32, device=image.device)
-                    for f in faces:
-                        x1, y1, x2, y2 = f["bbox_xyxy"]
-                        xa = max(int(round(float(x1) - pad)), 0)
-                        ya = max(int(round(float(y1) - pad)), 0)
-                        xb = min(int(round(float(x2) + pad)) + 1, W)
-                        yb = min(int(round(float(y2) + pad)) + 1, H)
-                        if xb > xa and yb > ya:
-                            m[ya:yb, xa:xb] = 1.0
-                    cm_list.append(m)
-                combined_mask = torch.stack(cm_list)
-                n_empty = sum(1 for m in cm_list if float(m.max()) == 0.0)
-                if n_empty:
-                    logger.warning(f"box_mask: no face detected on {n_empty}/{len(cm_list)} frames — those keep the original image")
-        if combined_mask is None:
-            # Load and cache BBox model
-            if bbox_model_name not in self._bbox_cache:
-                bbox_model_path = folder_paths.get_full_path("ultralytics", bbox_model_name)
-                model = subcore.load_yolo(bbox_model_path)
-                self._bbox_cache[bbox_model_name] = subcore.UltraBBoxDetector(model)
-            bbox_detector = self._bbox_cache[bbox_model_name]
+        # 区域来源（显式链路，无静默兜底）：
+        # swap_mask ← ReActor 的 SWAP_MASK 输出（必需，继承前节点已算好的换脸区域）；
+        # mask_optional ← 用户外接自定义 mask，连接时优先（显式覆盖）。
+        combined_mask = mask_optional if mask_optional is not None else swap_mask
+        if (not isinstance(combined_mask, torch.Tensor)) or combined_mask.shape[0] != image.shape[0] or tuple(combined_mask.shape[1:3]) != tuple(image.shape[1:3]):
+            raise RuntimeError(
+                f"MaskHelper: region mask shape {getattr(combined_mask, 'shape', type(combined_mask).__name__)} "
+                f"doesn't match image {tuple(image.shape)} — check the SWAP_MASK / mask_optional connection"
+            )
+        if combined_mask.dtype != torch.float32:
+            combined_mask = combined_mask.float()
 
-            # tensor_to_pil 仅取 batch[0]：整批一起检测会让所有帧共用第 0 帧的人脸框，
-            # 人脸一旦移动 mask 即错位（换脸结果被合成回原图）——必须逐帧检测。
-            frame_count = image.shape[0] if image.ndim == 4 else 1
-            segs_per_frame = []
-            for i in range(frame_count):
-                image_i = image[i:i+1] if image.ndim == 4 else image
-                segs_frame = bbox_detector.detect(
-                    image_i, bbox_threshold, bbox_dilation,
-                    bbox_crop_factor, bbox_drop_size, self.detailer_hook
-                )
-                if self.labels != 'all':
-                    labels = self.labels.split(',') if isinstance(self.labels, str) else self.labels
-                    segs_frame, _ = masking_segs.filter(segs_frame, labels)
-                segs_per_frame.append(segs_frame)
-
-            # 轨迹感知的漏检桥接（coast）：不能只看 segs 是否为空——场景里有
-            # 背景人脸时，主脸漏检的帧 segs 仍非空（只剩背景脸），SAM 只会
-            # 盖住背景脸，主脸区域 mask=0 → 整帧回退原图（换脸/原脸交替闪烁）。
-            # 这里把逐帧 segs 按轨迹匹配，主脸（任一已跟踪轨迹）缺失的帧
-            # 注入该轨迹最近一次的 Seg（最多 10 帧），保持 mask 连续。
-            _COAST_LIMIT = 10
-            _tracks = []  # {"seg": Seg, "center": (x, y), "size": s, "miss": 连续丢失帧数}
-            for i in range(frame_count):
-                segs = segs_per_frame[i]
-                if isinstance(segs, (tuple, list)) and len(segs) >= 2:
-                    _shape, _items = segs[0], list(segs[1])
-                else:
-                    _shape, _items = None, list(segs) if segs is not None else []
-                used = set()
-                for it in _items:
-                    try:
-                        b = np.asarray(it.bbox, dtype=np.float64)
-                    except Exception:
-                        continue
-                    c = ((b[0] + b[2]) * 0.5, (b[1] + b[3]) * 0.5)
-                    size = max(float(b[2] - b[0]), float(b[3] - b[1]), 1.0)
-                    best_t, best_d = None, None
-                    for ti, t in enumerate(_tracks):
-                        if ti in used:
-                            continue
-                        d = math.hypot(c[0] - t["center"][0], c[1] - t["center"][1])
-                        if d <= 0.6 * max(size, t["size"]) and (best_d is None or d < best_d):
-                            best_t, best_d = ti, d
-                    if best_t is not None:
-                        used.add(best_t)
-                        t = _tracks[best_t]
-                        t["seg"], t["center"], t["size"], t["miss"] = it, c, size, 0
-                    else:
-                        _tracks.append({"seg": it, "center": c, "size": size, "miss": 0})
-                        used.add(len(_tracks) - 1)
-                injected = []
-                for ti, t in enumerate(_tracks):
-                    if ti in used:
-                        continue
-                    t["miss"] += 1
-                    if t["miss"] <= _COAST_LIMIT:
-                        injected.append(t["seg"])
-                if injected:
-                    segs_per_frame[i] = (_shape, _items + injected)
-
-            # Load and cache SAM model
-            if sam_model_name not in self._sam_cache:
-                sam_model_path = folder_paths.get_full_path("sams", sam_model_name)
-                if 'vit_h' in sam_model_name:
-                    model_kind = 'vit_h'
-                elif 'vit_l' in sam_model_name:
-                    model_kind = 'vit_l'
-                else:
-                    model_kind = 'vit_b'
-                sam = sam_model_registry[model_kind](checkpoint=sam_model_path)
-                size = os.path.getsize(sam_model_path)
-                sam.safe_to = core.SafeToGPU(size)
-                sam.safe_to.to_device(sam, device)
-                sam.is_auto_mode = self.device_mode == "AUTO"
-                self._sam_cache[sam_model_name] = sam
-            else:
-                sam = self._sam_cache[sam_model_name]
-
-            # Handle batched input（segs_per_frame[i] 为 (shape, items)，make_sam_mask_segmented 内部取 segs[1]）
-            if image.ndim == 4:
-                combined_masks = []
-                for i in range(image.shape[0]):
-                    image_i = image[i]
-                    mask_i, _ = core.make_sam_mask_segmented(
-                        sam, segs_per_frame[i], image_i, self.detection_hint,
-                        sam_dilation, sam_threshold, bbox_expansion,
-                        mask_hint_threshold, mask_hint_use_negative
-                    )
-                    combined_masks.append(mask_i)
-                combined_mask = torch.stack(combined_masks)
-            else:
-                combined_mask, _ = core.make_sam_mask_segmented(
-                    sam, segs_per_frame[0], image, self.detection_hint,
-                    sam_dilation, sam_threshold, bbox_expansion,
-                    mask_hint_threshold, mask_hint_use_negative
-                )
-
-        # Маски обрабатываем на compute device (как раньше, когда SAM возвращал
-        # маски уже на GPU): morph/eye/blur покадровые и не зависят от устройства.
+        # Маски обрабатываем на compute device: morph/eye/blur покадровые и не
+        # зависят от устройства.
         if isinstance(combined_mask, torch.Tensor) and combined_mask.device != device:
             combined_mask = combined_mask.to(device)
 
@@ -1824,17 +1751,11 @@ class MaskHelper:
 
         # Preserve original eyes: exclude eye regions from the swap mask (authoritative RetinaFace detection)
         if mask_eyes:
-            if faces_for_mask is not None:
-                # box_mask mode: reuse the detection already done for the box mask
-                eye_mask = self._eye_mask_from_faces(faces_for_mask, int(image.shape[0]), int(image.shape[1]), int(image.shape[2]), eye_size, eye_dilation, eye_feather, dbg=self._eye_debug)
-            else:
-                eye_mask = self._build_eye_mask(image, eye_size, eye_dilation, eye_feather)
-            if eye_mask is not None:
-                eye_mask = eye_mask.to(device=combined_mask.device, dtype=combined_mask.dtype)
-                if eye_mask.shape[0] == combined_mask.shape[0]:
-                    combined_mask = combined_mask * (1.0 - eye_mask)
-                else:
-                    logger.warning(f"mask_eyes: batch mismatch (mask {combined_mask.shape[0]} vs eyes {eye_mask.shape[0]}), skipped")
+            eye_mask = self._build_eye_mask(image, eye_size, eye_dilation, eye_feather, region_mask=combined_mask)
+            eye_mask = eye_mask.to(device=combined_mask.device, dtype=combined_mask.dtype)
+            if eye_mask.shape[0] != combined_mask.shape[0]:
+                raise RuntimeError(f"mask_eyes: eye batch {eye_mask.shape[0]} doesn't match mask batch {combined_mask.shape[0]}")
+            combined_mask = combined_mask * (1.0 - eye_mask)
 
         # Gaussian blur
         if blur_radius > 0:
@@ -1876,45 +1797,6 @@ class MaskHelper:
             if mask_blurred.device.type != 'cpu':
                 mask_blurred = mask_blurred.cpu()
             mask_image_final = mask_blurred  # отпускаем GPU-копию маски
-
-            # —— mask 失效保底（终极防线）——
-            # 换脸真正发生时 |swapped - original| 在脸区域必然显著非零，且差异区
-            # 之外两图逐像素相同。逐帧检查 mask 是否真的把换好的脸"显示"出来了：
-            # 若 mask 在差异区域的覆盖率过低（任何检测类失效：漏检/SAM 空掩码/
-            # 阈值过严/轨迹过期），沿用上一个正常帧的 mask（最多 10 帧）。
-            # 正常帧完全不受影响；眼洞（瞳孔保持）随 mask 一起沿用。
-            try:
-                if mask_optional is None:
-                    _CH = 8
-                    _cores = []
-                    for s in range(0, image.shape[0], _CH):
-                        e = min(s + _CH, image.shape[0])
-                        d = (swapped_image[s:e].to(device, torch.float32) - image[s:e].to(device, torch.float32)).abs().mean(dim=-1)
-                        _cores.append((d > 0.08).cpu())
-                    _core = torch.cat(_cores, dim=0) if _cores else None  # (B,H,W) bool
-                    if _core is not None:
-                        _total = _core.sum(dim=(1, 2)).float()
-                        _cover = (mask0 * _core.float()).sum(dim=(1, 2))
-                        _area_gate = 0.001 * float(mask0.shape[1] * mask0.shape[2])
-                        _bad = (_total > _area_gate) & ((_cover / _total.clamp(min=1.0)) < 0.5)
-                        _fixed = []
-                        _last_good = None
-                        _last_good_i = None
-                        _COAST = 10
-                        for i in range(mask0.shape[0]):
-                            if bool(_bad[i]):
-                                if _last_good is not None and (i - _last_good_i) <= _COAST:
-                                    mask0[i] = _last_good
-                                    _fixed.append(i)
-                            else:
-                                _last_good = mask0[i].clone()
-                                _last_good_i = i
-                        if _fixed:
-                            logger.status(
-                                f"mask: the swapped face was hidden by the mask on {len(_fixed)} frame(s) "
-                                f"— restored from the last good frame's mask")
-            except Exception as _e:
-                logger.warning(f"mask: swapped-face visibility fallback skipped ({_e})")
 
             C0 = int(image.shape[3])
 
