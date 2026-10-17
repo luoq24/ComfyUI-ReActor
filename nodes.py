@@ -132,10 +132,10 @@ def model_names():
     return {os.path.basename(x): x for x in models}
 
 
-def build_swap_mask(input_image, result, eps=0.05, dilate_px=6):
-    """换脸区域 = |swapped - original| 的 RGB 均值 > eps，再膨胀 dilate_px。
-    换脸（含 GFPGAN/blend）只在脸部区域改像素，两图在区域外逐像素相同——
-    差分就是换脸区域的像素级精确描述，零检测、零模型。"""
+def build_swap_mask(input_image, result, eps=1.0 / 255.0, dilate_px=6):
+    """保留任一通道超过一个灰阶的改动，再膨胀以覆盖融合边缘。
+    高差分阈值会把肤色接近原图的脸颊切掉，二次合成时形成明暗接缝。
+    一个灰阶的容差用于忽略图像转换产生的量化误差。"""
     k = dilate_px * 2 + 1
     # 差分/膨胀搬上 GPU：243 帧 CPU max_pool2d 约 29s，GPU 约 3s
     device = torch.device("cuda") if torch.cuda.is_available() else result.device
@@ -145,7 +145,7 @@ def build_swap_mask(input_image, result, eps=0.05, dilate_px=6):
         e = min(s + step, int(result.shape[0]))
         r = result[s:e].float().to(device)
         i = input_image[s:e].float().to(device)
-        d = (r - i).abs().mean(dim=-1)
+        d = (r - i).abs().amax(dim=-1)
         m = (d > eps).float().unsqueeze(1)
         m = F.max_pool2d(m, kernel_size=k, stride=1, padding=dilate_px)
         masks.append(m.squeeze(1).cpu())
@@ -342,7 +342,7 @@ class reactor:
                     do_restore = True
                     # if self.last_swapped_indices is not None:
                     #     do_restore = idx in self.last_swapped_indices
-                    if swapped_bboxes and self.restore_swapped_only:
+                    if swapped_bboxes is not None and self.restore_swapped_only:
                         do_restore = False
                         if current_bbox is not None:
                             for s_idx, sbox in enumerate(swapped_bboxes):
@@ -1788,7 +1788,8 @@ class MaskHelper:
         if blur_radius > 0:
             blur_key = f"{blur_radius}_{sigma_factor}"
             if blur_key not in self._blur_cache:
-                self._blur_cache[blur_key] = T.GaussianBlur(kernel_size=blur_radius * 2 + 1, sigma=sigma_factor)
+                sigma = max(blur_radius / 3.0, 0.1) * sigma_factor
+                self._blur_cache[blur_key] = T.GaussianBlur(kernel_size=blur_radius * 2 + 1, sigma=sigma)
             blur = self._blur_cache[blur_key]
             mask_blurred = blur(combined_mask.unsqueeze(1)).squeeze(1)
         else:

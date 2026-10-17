@@ -484,8 +484,11 @@ def track_face_across_frames(frames_faces, order, slot=0, taken=None):
             candidates = ordered
 
         if prev_bbox is None:
-            if slot < len(ordered):
-                f = ordered[slot]
+            # 低阈值检测保留困难帧；建轨时优先用可靠检测，避免大面积误检锁死跟踪。
+            confident = [f for f in ordered if float(f.det_score) >= 0.6]
+            seed_faces = confident if len(confident) > slot else ordered
+            if slot < len(seed_faces):
+                f = seed_faces[slot]
                 if taken is None or id(f) not in taken[i]:
                     selected[i] = f
                     bbox = np.asarray(f.bbox, dtype=np.float64)
